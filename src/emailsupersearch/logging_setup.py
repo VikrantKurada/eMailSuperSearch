@@ -9,7 +9,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 PATH_RE = re.compile(
-    r'(?:[A-Za-z]:|\\\\[^\\\s]+)(?:\\[^\\/:*?"<>|\r\n]+)+\.(?:msg|eml|pdf|docx|xlsx|xlsm|pptx)\b'
+    r'(?:[A-Za-z]:|\\\\[^\\\s]+)(?:\\[^\\/:*?"<>|\r\n]+)+\.(?:msg|eml|pdf|docx|xlsx|xlsm|pptx)\b',
+    re.IGNORECASE,
 )
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 

@@ -1,7 +1,23 @@
+import logging
 import re
 from logging.handlers import RotatingFileHandler
 
+import pytest
+
+from emailsupersearch import logging_setup
 from emailsupersearch.logging_setup import configure_logging, log_subject, redact
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _reset_logging_state():
+    yield
+    for name in ("t", "t2", "r", "emailsupersearch"):
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        logger.setLevel(logging.NOTSET)
+        logging_setup._HANDLERS.pop(name, None)
 
 
 def test_redact_hashes_email_addresses_and_paths():
@@ -11,6 +27,11 @@ def test_redact_hashes_email_addresses_and_paths():
 
 
 def test_redact_unc_path(): assert r"\\server" not in redact(r"\\server\share\Q1 Report.pdf")
+
+
+def test_redact_path_is_case_insensitive():
+    out = redact(r"see C:\x\REPORT.PDF now")
+    assert "REPORT.PDF" not in out and "<path:" in out
 
 
 def test_info_handler_redacts_but_debug_does_not(tmp_path):
