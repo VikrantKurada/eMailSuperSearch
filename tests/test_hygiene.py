@@ -131,3 +131,55 @@ def test_strip_signature_trailing_block_with_a_long_line_is_kept():
 
 def test_strip_signature_trailing_block_ignores_trailing_blank_lines():
     assert strip_signature("Done.\n\nMei Lin\n+44 20 7946 0000\n\n  \n").strip() == "Done."
+
+
+def test_reference_number_last_paragraph_is_kept():
+    for last in (
+        "PO: 4500123456",
+        "Invoice no. 100234567",
+        "Ref 20261020001",
+        "Deadline: 2026-10-24 12:00",
+    ):
+        body = f"Done.\n\n{last}"
+        assert strip_signature(body) == body, last
+
+
+def test_grouped_phone_signature_is_still_removed():
+    for phone in ("+44 20 7946 0000", "020 7946 0000", "(020) 7946-0000", "+1 (555) 123-4567"):
+        body = f"Done.\n\nMei Lin\n{phone}"
+        assert strip_signature(body).strip() == "Done.", phone
+
+
+def test_bare_thanks_reply_keeps_only_thanks():
+    quoted = "\n\nOn Tue, Mar 3 Priya wrote:\n> the old chain text"
+    assert new_text("Thanks," + quoted, has_parent=True) == "Thanks,"
+    assert new_text("Thanks" + quoted, has_parent=True) == "Thanks"
+    assert new_text("Sent from my iPhone" + quoted, has_parent=True) == "Sent from my iPhone"
+
+
+def test_interleaved_reply_keeps_answers():
+    body = "Hi John,\n\n> Can you confirm 4%?\nYes, 4% is fine.\n> And the date?\nWe go live on 10 Nov.\n"
+    result = new_text(body, has_parent=True)
+    assert "Yes, 4% is fine." in result
+    assert "We go live on 10 Nov." in result
+    assert not any(line.startswith(">") for line in result.splitlines())
+    assert "Can you confirm" not in result
+
+
+def test_interleaved_reply_drops_on_wrote_header_but_keeps_answers():
+    body = "On Tue, Mar 3 Priya wrote:\n> Q1?\nA1.\n> Q2?\nA2."
+    result = strip_quoted(body)
+    assert "wrote:" not in result
+    assert "A1." in result and "A2." in result
+
+
+def test_bottom_posted_reply_still_cut():
+    body = "Yes.\n\nOn Tue, Mar 3 Priya wrote:\n> old\n> text"
+    assert strip_quoted(body).strip() == "Yes."
+    assert new_text(body, has_parent=True) == "Yes."
+
+
+def test_quote_followed_only_by_signature_is_not_interleaved():
+    body = "Yes.\n\nOn Tue Priya wrote:\n> old\n\n-- \nMei Lin\nFinance"
+    assert strip_quoted(body).strip() == "Yes."
+    assert new_text(body, has_parent=True) == "Yes."
