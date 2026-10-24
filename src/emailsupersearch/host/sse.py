@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
-from collections.abc import AsyncGenerator
 
 QUEUE_MAX = 1000  # events held per subscriber; on overflow the oldest is dropped
 
@@ -52,30 +51,26 @@ class EventBus:
         with self._lock:
             return self._last.get(topic)
 
-    def subscribe(self, topic: str) -> AsyncGenerator[dict, None]:
-        """Start receiving ``topic`` now and return an async iterator over its events, from the loop.
+    def subscribe(self, topic: str) -> Subscription:
+        """Start receiving ``topic`` now and return a ``Subscription`` over its events, from the loop.
 
         The subscriber's queue is registered by this call, so nothing published before the first ``__anext__`` is
-        lost. It is unregistered when the iterator finishes: on ``aclose()``, on cancellation (a client that
-        disconnects) or when the loop finalises it. Iterate what this returns; an iterator dropped before its first
-        ``__anext__`` never runs its cleanup and stays registered, holding at most ``QUEUE_MAX`` events.
+        lost. The caller unregisters it with ``aclose()``, in a ``finally``: that works whether or not iteration
+        ever started, a client that disconnects before the first event included.
         """
-        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX)
+        return Subscription(self, topic)
+
+    def _register(self, topic: str, queue: asyncio.Queue[dict]) -> None:
         with self._lock:
             self._subscribers.setdefault(topic, set()).add(queue)
-        return self._drain(topic, queue)
 
-    async def _drain(self, topic: str, queue: asyncio.Queue[dict]) -> AsyncGenerator[dict, None]:
-        try:
-            while True:
-                yield await queue.get()
-        finally:
-            with self._lock:
-                queues = self._subscribers.get(topic)
-                if queues is not None:
-                    queues.discard(queue)
-                    if not queues:
-                        del self._subscribers[topic]
+    def _unregister(self, topic: str, queue: asyncio.Queue[dict]) -> None:
+        with self._lock:
+            queues = self._subscribers.get(topic)
+            if queues is not None:
+                queues.discard(queue)
+                if not queues:
+                    del self._subscribers[topic]
 
     def _deliver(self, topic: str, event: dict) -> None:
         with self._lock:
@@ -85,6 +80,36 @@ class EventBus:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
             queue.put_nowait(event)
+
+
+class Subscription:
+    """One subscriber's events on one topic, as an async iterator; made by ``EventBus.subscribe``.
+
+    Its queue (at most ``QUEUE_MAX`` events) is registered on creation. ``aclose()`` unregisters it, whether or not
+    iteration ever started, and may be called again; once closed, iteration ends.
+    """
+
+    def __init__(self, bus: EventBus, topic: str) -> None:
+        self._bus = bus
+        self._topic = topic
+        self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX)
+        self._closed = False
+        bus._register(topic, self._queue)
+
+    def __aiter__(self) -> Subscription:
+        return self
+
+    async def __anext__(self) -> dict:
+        if self._closed:
+            raise StopAsyncIteration
+        return await self._queue.get()
+
+    async def aclose(self) -> None:
+        """Stop receiving: unregister the queue. Safe to call twice, and before any ``__anext__``."""
+        if self._closed:
+            return
+        self._closed = True
+        self._bus._unregister(self._topic, self._queue)
 
 
 def _running_on(loop: asyncio.AbstractEventLoop) -> bool:

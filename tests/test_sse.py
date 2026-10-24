@@ -1,4 +1,4 @@
-"""The event bus: cross-thread delivery, eager subscription and the bounded subscriber queue."""
+"""The event bus: cross-thread delivery, eager subscription, closing and the bounded subscriber queue."""
 
 import asyncio
 import threading
@@ -53,3 +53,20 @@ def test_full_queue_drops_oldest():
             await events.aclose()
 
     assert asyncio.run(main()) == {"n": 1}
+
+
+def test_aclose_before_first_next_unregisters():
+    bus = EventBus()
+
+    async def main():
+        bus.attach_loop(asyncio.get_running_loop())
+        events = bus.subscribe("t")
+        assert "t" in bus._subscribers
+        await events.aclose()  # never iterated: a client gone before its first event
+        assert "t" not in bus._subscribers
+        await events.aclose()  # a second close is harmless
+        bus.publish("t", {"n": 1})
+        return [event async for event in events]  # closed: iteration ends at once
+
+    assert asyncio.run(main()) == []
+    assert bus._subscribers == {}

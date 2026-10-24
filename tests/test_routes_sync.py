@@ -6,10 +6,11 @@ import time
 from dataclasses import fields
 from pathlib import Path
 
-from helpers import wait_until
+from helpers import make_eml_bytes, wait_until
 
 from emailsupersearch.host import folder_picker
 from emailsupersearch.host.folder_picker import pick_folder
+from emailsupersearch.host.routes_sync import public_event
 from emailsupersearch.jobs.supervisor import SyncStatus
 
 _STREAM_DEADLINE_S = 60  # a keepalive ping arrives every 15 s, so the loop re-checks this at least that often
@@ -39,20 +40,38 @@ def test_sync_status_route(client, project, host_services):
     assert client.post(f"/api/projects/{blocked.id}/sync").status_code == 409
 
 
-def test_sync_events_stream_yields_scan_finished(client, indexed_project, host_services):
+def test_sync_events_stream_yields_scan_finished(client, indexed_project, host_services, corpus_dir):
     seen = False
+    lines = []
     deadline = time.monotonic() + _STREAM_DEADLINE_S
     with client.stream("GET", f"/api/projects/{indexed_project}/sync/events") as r:
+        (corpus_dir / "sse-new.eml").write_bytes(make_eml_bytes("sse"))  # a file to index: its event has a path
         client.post(f"/api/projects/{indexed_project}/sync")   # subscribe first, then trigger
         for line in r.iter_lines():
-            if '"scan_finished"' in line:
+            lines.append(line)
+            # The scan that indexed the new file; a watcher-triggered scan may come first, also after the write.
+            if '"scan_finished"' in line and any('"file_indexed"' in earlier for earlier in lines):
                 seen = True
                 break
             if time.monotonic() > deadline:
                 break
     assert seen
+    assert lines[0] == "event: status" and lines[1].startswith("data: {")
+    for line in lines:  # the file event went out without its path
+        assert corpus_dir.parent.name not in line and "sse-new" not in line, line
     # Closing the stream ends the response, whose generator closes its subscription.
     wait_until(lambda: f"sync:{indexed_project}" not in host_services.bus._subscribers, 5)
+
+
+def test_public_event_drops_paths():
+    indexed = {"type": "file_indexed", "path": "C:\\Mail\\a.msg", "status": "indexed", "message_key": "k@x"}
+    assert public_event(indexed) == {"type": "file_indexed", "status": "indexed", "message_key": "k@x"}
+    renamed = {"type": "renamed", "old": "C:\\Mail\\a.msg", "new": "C:\\Mail\\b.msg"}
+    assert public_event(renamed) == {"type": "renamed"}
+    finished = {"type": "scan_finished", "scan_id": 3, "to_parse": 2, "errors": 0, "paths": ["C:\\Mail"]}
+    assert public_event(finished) == {"type": "scan_finished", "scan_id": 3, "to_parse": 2, "errors": 0}
+    failed = {"type": "error", "step": "scan", "error": "PermissionError", "reason": "C:\\Mail", "flag": True}
+    assert public_event(failed) == {"type": "error"}
 
 
 def test_pick_folder_route_uses_picker(client, monkeypatch, tmp_path):

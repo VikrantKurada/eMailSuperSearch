@@ -4,9 +4,9 @@
 - ``GET /api/projects/{id}/sync/status``: the supervisor's ``SyncStatus``.
 - ``GET /api/projects/{id}/sync/events``: a ``text/event-stream`` that first sends the current ``SyncStatus`` as a
   ``status`` event, then every event the supervisor publishes on the bus topic ``sync:<id>``, named by its
-  ``type`` and carrying the event as JSON data. The stream subscribes before it reads the status, so nothing
-  published in between is lost, and it closes the subscription however it ends, a client disconnecting included.
-  sse-starlette sends a keepalive comment every 15 s.
+  ``type`` and carrying ``public_event(event)`` as JSON data: never a path or an error text. The stream subscribes
+  before it reads the status, so nothing published in between is lost, and it closes the subscription however it
+  ends, a client disconnecting included. sse-starlette sends a keepalive comment every 15 s.
 - ``POST /api/pick-folder``: show the native folder dialog on the host's desktop; ``{"path": <folder> | null}``,
   null when it was cancelled or could not be shown.
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import asdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sse_starlette import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
@@ -34,6 +34,19 @@ if TYPE_CHECKING:
     from emailsupersearch.jobs.supervisor import ProjectSupervisor
 
 PING_INTERVAL_S = 15
+
+_PUBLIC_FIELDS = frozenset({"type", "status", "message_key", "scan_id"})
+
+
+def public_event(event: dict[str, Any]) -> dict[str, Any]:
+    """The part of a supervisor or pipeline event a progress stream may carry: ``type``, ``status``,
+    ``message_key``, ``scan_id`` and every integer field (the counts). Everything else, the ``path``, ``old`` and
+    ``new`` of a file event and any error text above all, is dropped."""
+    return {
+        key: value
+        for key, value in event.items()
+        if key in _PUBLIC_FIELDS or (isinstance(value, int) and not isinstance(value, bool))
+    }
 
 
 def _project_id(request: Request) -> str:
@@ -67,7 +80,8 @@ async def _sync_event_stream(
         status = await run_in_threadpool(sup.status)  # it reads the store: keep the event loop free
         yield {"event": "status", "data": json.dumps(asdict(status))}
         async for event in sub:
-            yield {"event": event.get("type", "event"), "data": json.dumps(event)}
+            public = public_event(event)
+            yield {"event": public.get("type", "event"), "data": json.dumps(public)}
     finally:
         await sub.aclose()
 
