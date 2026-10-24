@@ -19,7 +19,8 @@ from extract_msg.enums import AttachmentType, ErrorBehavior, RecipientType
 from extract_msg.msg_classes import MessageBase
 from extract_msg.null_date import NullDate
 
-from emailsupersearch.ingest.eml_adapter import _kind_for, html_to_text
+from emailsupersearch.ingest.attachments import kind_for
+from emailsupersearch.ingest.eml_adapter import html_to_text
 from emailsupersearch.types import ParsedAttachment, ParsedMessage, Recipient
 
 MSG_CONVERSATION_INDEX_STREAM = "__substg1.0_00710102"
@@ -233,7 +234,7 @@ def _attachments(msg: MessageBase, depth: int) -> list[ParsedAttachment]:
         nested: ParsedMessage | None = None
         if att.type == AttachmentType.DATA:
             data = att.data if isinstance(att.data, bytes) else None
-            kind = _kind_for(filename, mime)  # Task 9 replaces this with the shared kind_for
+            kind = kind_for(filename, mime)
         elif att.type == AttachmentType.MSG:
             kind = "msg"
             if depth < _MAX_NESTING:

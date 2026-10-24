@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import email
 import email.policy
-import os
 import re
 from datetime import UTC
 from email.message import EmailMessage
@@ -15,30 +14,9 @@ from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-from emailsupersearch.types import (
-    AttachmentKind,
-    ParsedAttachment,
-    ParsedMessage,
-    Recipient,
-)
+from emailsupersearch.ingest.attachments import kind_for
+from emailsupersearch.types import ParsedAttachment, ParsedMessage, Recipient
 
-# Task 9 replaces this map with the shared ``kind_for``.
-_SUFFIX_KINDS: dict[str, AttachmentKind] = {
-    ".pdf": "pdf",
-    ".docx": "docx",
-    ".xlsx": "xlsx",
-    ".xlsm": "xlsx",
-    ".pptx": "pptx",
-    ".png": "image",
-    ".jpg": "image",
-    ".jpeg": "image",
-    ".tif": "image",
-    ".tiff": "image",
-    ".bmp": "image",
-    ".webp": "image",
-    ".msg": "msg",
-    ".eml": "eml",
-}
 _WHITESPACE = re.compile(r"\s+")
 # fmt: off
 _BLOCK_TAGS = frozenset([
@@ -119,19 +97,6 @@ def _text_of(part: EmailMessage) -> str:
         return (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
 
 
-def _kind_for(filename: str, mime: str) -> AttachmentKind:
-    kind = _SUFFIX_KINDS.get(os.path.splitext(filename)[1].lower())
-    if kind is not None:
-        return kind
-    if mime == "message/rfc822":
-        return "eml"
-    if mime.startswith("image/"):
-        return "image"
-    if mime == "application/pdf":
-        return "pdf"
-    return "other"
-
-
 def _sent_ts(msg: EmailMessage) -> int | None:
     header = msg["Date"]
     if header is None:
@@ -198,7 +163,7 @@ def _attachments(
             data, nested, kind = inner.as_bytes(), _convert(inner, mtime), "eml"
         else:
             data = _attachment_bytes(part)
-            kind = _kind_for(filename, mime)
+            kind = kind_for(filename, mime)
         found.append(
             ParsedAttachment(
                 ordinal,
