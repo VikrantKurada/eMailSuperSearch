@@ -1,0 +1,99 @@
+**Product Requirements Document (PRD)**
+**ProductName:** eMailSuperSearch
+**What Does It Do:** Offline Email Semantic Search, Graph & RAG Assistant
+**Document Status:** Final
+
+---
+
+## 1. Product Overview & Vision
+
+A fully offline, zero-admin semantic search engine and conversational AI assistant for locally archived Outlook `.msg` files.
+
+This system processes emails and their attachments, stores them in a local vector database, extracts relationship data into a knowledge graph, and provides both exact metadata filtering and a Retrieval-Augmented Generation (RAG) chat interface. It is designed to operate entirely invisibly in the background, maintaining a 1:1 mirror of the user's local inbox while strictly adhering to corporate zero-trust and zero-admin policies.
+
+---
+
+## 2. Technical Environment & Constraints
+
+The solution must operate entirely within the user space, bypassing system-level installers or admin prompts. All data processing, OCR, and AI inference must occur locally on the host machine to guarantee absolute data privacy.
+
+| Category | Specification |
+| --- | --- |
+| **Operating System** | Windows 64-bit (x64) |
+| **Permissions** | Standard User (No Administrative Rights allowed) |
+| **Development Environment** | VS Code, Jupyter Notebook, standard Python installation |
+| **Host Hardware** | AMD Ryzen 5 PRO 8640HS (3.50 GHz), 16.0 GB RAM (15.3 GB usable) |
+| **Graphics Processing** | AMD Radeon 760M Integrated Graphics |
+| **Network Security** | 100% Offline execution (air-gapped capability post-library download) |
+
+---
+
+## 3. Core Tech Stack
+
+* **Email Parsing:** `extract-msg` (msg metadata and body text)
+* **Attachment Parsing:** `PyMuPDF` (PDF text), `python-docx` (Word), `easyocr` (Image/Scanned PDF OCR)
+* **Vector Database:** `chromadb` (Local persistent storage and embedding generation)
+* **Graph Processing:** `networkx` (triple extraction/routing), `pyvis` (offline HTML visualization)
+* **Data Manipulation & Export:** `pandas`, `openpyxl`
+* **LLM Inference:** `gpt4all` (Llama 3 8B Instruct, Q4_0 quantized)
+
+---
+
+## 4. Functional Requirements
+
+### 4.1 Data Ingestion & Synchronization
+
+* **Incremental Two-Way Sync:** Identify new, existing, and deleted `.msg` files in the target directory using filename-based Python `set` mathematics.
+* **Metadata Standardization:** Extract Sender, Subject, Filepath, and Date. Convert Dates into Unix timestamps for mathematical range filtering.
+* **Automated Pruning:** Automatically remove vector and graph records from the database if the corresponding `.msg` file is deleted from the Windows folder.
+
+### 4.2 Attachment Processing & OCR
+
+* **Native Text Extraction:** Extract raw text directly from standard `.pdf` and `.docx` attachments via `io.BytesIO` in-memory buffers.
+* **Scanned Image OCR:** Automatically detect scanned PDFs (pages yielding <20 characters) and image files. Convert them to images via `PyMuPDF` and run local optical character recognition using the `easyocr` user-cached model.
+* **Semantic Unification:** Append all extracted attachment text directly to the parent email's body text prior to embedding, ensuring attachment content is searchable via the parent file.
+
+### 4.3 Semantic Search & Filtering
+
+* **Vector Querying:** Execute natural language semantic searches against the email corpus.
+* **Hard Metadata Filtering:** Support exact-match filtering for Senders and mathematical range filtering (`$gte`, `$lte`) for Dates via ChromaDB's MongoDB-style syntax.
+* **Compound Logic:** Allow combinations of semantic text queries with multiple hard filters using logical operators (`$and`, `$or`).
+
+### 4.4 Data Export & Reporting
+
+* **Excel Generation:** Export search results directly to `.xlsx` files using `pandas` and `openpyxl`.
+* **Dynamic Formatting:** Automatically apply bold headers, text wrapping for long email previews, and adjusted column widths for readability.
+* **Actionable URI Links:** Convert local file paths into active `file:///` hyperlinks, allowing users to launch the original `.msg` file in Outlook directly from the spreadsheet.
+
+### 4.5 Conversational RAG Interface
+
+* **Local LLM Integration:** Utilize a quantized Llama 3 8B Instruct model executed via the `gpt4all` Python library.
+* **Context Injection:** Retrieve the top 5 most semantically relevant emails based on user prompts and inject them into the LLM's system context window.
+* **Strict Grounding:** Prompt-engineer the LLM to answer *only* using the provided context blocks. Force the model to cite the sender and date of its sources or output a generic refusal if the answer is not present.
+
+### 4.6 Knowledge Graph Extraction & Visualization
+
+* **Triple Extraction:** Use the local LLM during the ingestion pipeline to parse email bodies and extract RDF-style relationships (e.g., `[Sender] -> [DISCUSSED] -> [Project Name]`).
+* **In-Memory Graph Construction:** Map these entities into a directional `networkx` graph. Auto-increment edge weights when recurring relationships are detected.
+* **GraphRAG Querying:** Query both ChromaDB (for semantics) and NetworkX (for relationship nodes) simultaneously to provide enriched context to the RAG chat interface.
+* **Interactive HTML Export:** Convert the graph into an interactive, physics-based UI using `pyvis`, saved locally as `knowledge_map.html` for offline browser exploration.
+
+### 4.7 Automation & Logging
+
+* **Background Task Execution:** Run the ingestion script invisibly using `pythonw.exe`, orchestrated by Windows Task Scheduler (triggering only when the user is logged on to bypass admin requirements).
+* **Rotational Logging:** Implement `logging.handlers.RotatingFileHandler` to capture sync operations and OCR crash traces. Cap logs at 5MB and retain a maximum of 3 historical backups (20MB total footprint).
+
+---
+
+## 5. Non-Functional Requirements
+
+### 5.1 Performance & Hardware Optimization
+
+* **Vulkan GPU Offloading:** LLM inference must be explicitly routed to the AMD Radeon 760M integrated graphics via the `device="amd"` initialization flag to accelerate token generation and reduce CPU bottlenecking.
+* **Memory Bounding:** The system must share the ~15 GB of usable UMA RAM gracefully. The LLM must not exceed a 6 GB footprint, and graph visualization outputs must be artificially capped (e.g., top 500 nodes) to prevent browser out-of-memory crashes.
+* **Asynchronous Graphing:** Because LLM-based entity extraction is computationally heavy, graph processing must occur asynchronously in the background task to prevent locking up the local machine.
+
+### 5.2 Security & Privacy
+
+* **Zero Telemetry:** The architecture forbids external API calls. ChromaDB, EasyOCR, and GPT4All must operate strictly within the offline localhost environment.
+* **User-Space Containment:** All dependencies, databases (`./email_vector_db`), log files, and ML model weights (`~/.cache/gpt4all`) must reside entirely within the user's local profile directory to satisfy zero-admin policies.

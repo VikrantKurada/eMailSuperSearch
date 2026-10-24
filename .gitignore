@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+.superpowers/
+src/emailsupersearch/ui/dist/
+ui/node_modules/
+packages/models-en/src/emailsupersearch_models_en/data/
+tests/fixtures/msg/
+tests/fixtures/owner/
+.pytest_cache/

@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eMailSuperSearch mockup: artefact kinds (owner chose all four)</title>
+<style>
+    /*
+     * BRAINSTORM COMPANION FRAME TEMPLATE
+     *
+     * This template provides a consistent frame with:
+     * - OS-aware light/dark theming
+     * - Header branding and connection status
+     * - Scrollable main content area
+     * - CSS helpers for common UI patterns
+     *
+     * Content is injected via placeholder comment in #frame-content.
+     */
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    /* ===== THEME VARIABLES ===== */
+    :root {
+      --bg-primary: #f5f5f7;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e5e5e7;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --text-tertiary: #aeaeb2;
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --selected-bg: #e8f4fd;
+      --selected-border: #0071e3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #1d1d1f;
+        --bg-secondary: #2d2d2f;
+        --bg-tertiary: #3d3d3f;
+        --border: #424245;
+        --text-primary: #f5f5f7;
+        --text-secondary: #86868b;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --selected-bg: rgba(10, 132, 255, 0.15);
+        --selected-border: #0a84ff;
+      }
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* ===== FRAME STRUCTURE ===== */
+    .brand { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--text-secondary); line-height: 1; }
+    .brand a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; line-height: 1; }
+    .brand-copy { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; transform: translateY(-1px); }
+    .brand-logo { display: block; height: 1em; width: auto; max-width: 180px; flex-shrink: 0; filter: invert(1); }
+    @media (prefers-color-scheme: dark) {
+      .brand-logo { filter: none; }
+    }
+    .status { font-size: 0.7rem; color: var(--status-color, var(--success)); display: flex; align-items: center; gap: 0.4rem; justify-self: end; white-space: nowrap; line-height: 1; }
+    .status::before { content: ''; width: 6px; height: 6px; background: var(--status-color, var(--success)); border-radius: 50%; }
+
+    .main { flex: 1; overflow-y: auto; }
+    #frame-content { padding: 2rem; min-height: 100%; }
+
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-height: 42px;
+    }
+    .header .brand { justify-self: start; width: 100%; font-size: 0.75rem; line-height: 1; }
+    .header .status { grid-column: 2; line-height: 1; }
+    .header span {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+    .header .selected-text {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* ===== TYPOGRAPHY ===== */
+    h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .section { margin-bottom: 2rem; }
+    .label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+
+    /* ===== OPTIONS (for A/B/C choices) ===== */
+    .options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .option {
+      background: var(--bg-secondary);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+    .option:hover { border-color: var(--accent); }
+    .option.selected { background: var(--selected-bg); border-color: var(--selected-border); }
+    .option .letter {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      width: 1.75rem; height: 1.75rem;
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 0.85rem; flex-shrink: 0;
+    }
+    .option.selected .letter { background: var(--accent); color: white; }
+    .option .content { flex: 1; }
+    .option .content h3 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+    .option .content p { color: var(--text-secondary); font-size: 0.85rem; margin: 0; }
+
+    /* ===== CARDS (for showing designs/mockups) ===== */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .card.selected { border-color: var(--selected-border); border-width: 2px; }
+    .card-image { background: var(--bg-tertiary); aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+    .card-body { padding: 1rem; }
+    .card-body h3 { margin-bottom: 0.25rem; }
+    .card-body p { color: var(--text-secondary); font-size: 0.85rem; }
+
+    /* ===== MOCKUP CONTAINER ===== */
+    .mockup {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+    .mockup-header {
+      background: var(--bg-tertiary);
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .mockup-body { padding: 1.5rem; }
+
+    /* ===== SPLIT VIEW (side-by-side comparison) ===== */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+
+    /* ===== PROS/CONS ===== */
+    .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .pros, .cons { background: var(--bg-secondary); border-radius: 8px; padding: 1rem; }
+    .pros h4 { color: var(--success); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .cons h4 { color: var(--error); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pros ul, .cons ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .pros li, .cons li { margin-bottom: 0.25rem; }
+
+    /* ===== PLACEHOLDER (for mockup areas) ===== */
+    .placeholder {
+      background: var(--bg-tertiary);
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    /* ===== INLINE MOCKUP ELEMENTS ===== */
+    .mock-nav { background: var(--accent); color: white; padding: 0.75rem 1rem; display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .mock-sidebar { background: var(--bg-tertiary); padding: 1rem; min-width: 180px; }
+    .mock-content { padding: 1.5rem; flex: 1; }
+    .mock-button { background: var(--accent); color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.85rem; }
+    .mock-input { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; width: 100%; }
+  
+/* standalone copy: no live server, selection is cosmetic */
+.main { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem; }
+</style></head>
+<body><div class="main">
+<p class="label">Reviewed by the owner on 2026-10-24 during the design conversation. Static copy of the brainstorm screen; clicks do nothing.</p>
+<style>
+  .a-prev { width:100%; height:100%; padding:10px 12px; box-sizing:border-box; font-size:.62rem; color:var(--text-secondary); background:var(--bg-secondary); display:flex; flex-direction:column; justify-content:center; }
+  .a-prev svg { width:100%; height:auto; display:block; }
+  .a-doc h5 { margin:0 0 4px; font-size:.78rem; color:var(--text-primary); }
+  .a-doc p, .a-doc li { margin:0 0 2px; line-height:1.3; }
+  .a-doc ul { margin:2px 0 4px 12px; padding:0; }
+  .a-doc .src { border-top:1px dashed var(--border); margin-top:4px; padding-top:3px; font-size:.56rem; }
+  .a-tbl { width:100%; border-collapse:collapse; font-size:.58rem; color:var(--text-primary); }
+  .a-tbl th, .a-tbl td { border:1px solid var(--border); padding:2px 4px; text-align:left; vertical-align:top; }
+  .a-tbl th { background:var(--bg-tertiary); font-weight:600; }
+  .a-tbl td.m { color:var(--text-secondary); }
+  .a-fmt { font-size:.66rem; color:var(--text-secondary); margin-top:.35rem; }
+  .a-fmt span { display:inline-block; border:1px solid var(--border); border-radius:4px; padding:0 5px; margin-right:4px; background:var(--bg-primary); }
+  .a-how { margin-top:1.6rem; border:1px solid var(--border); border-radius:10px; padding:.9rem 1.1rem; background:var(--bg-secondary); font-size:.85rem; }
+  .a-how .label { margin-bottom:.4rem; }
+  .a-how ol { margin:.3rem 0 0 1.1rem; padding:0; }
+  .a-how li { margin:.2rem 0; color:var(--text-secondary); }
+  .a-how b { color:var(--text-primary); }
+</style>
+
+<h2>Artefacts made from a set of results</h2>
+<p class="subtitle">You asked for SVG images, write-ups and "other kinds of artefacts". These are the four I would build first. Click every one you want in the first version; leave out any you would not use. Each can also be started from a free-form request in the chat ("make me a …"), and every artefact carries the sender and date of the emails it was drawn from.</p>
+
+<div class="cards" data-multiselect>
+
+  <div class="card" data-choice="timeline-svg" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="a-prev">
+        <svg viewBox="0 0 300 110" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" font-size="8">
+          <line x1="20" y1="55" x2="280" y2="55" stroke="var(--border)" stroke-width="2"/>
+          <g fill="var(--accent)"><circle cx="40" cy="55" r="5"/><circle cx="115" cy="55" r="5"/><circle cx="190" cy="55" r="5"/><circle cx="262" cy="55" r="5"/></g>
+          <g fill="var(--text-primary)" text-anchor="middle"><text x="40" y="40">12 Feb</text><text x="115" y="40">27 Feb</text><text x="190" y="40">10 Mar</text><text x="262" y="40">18 Mar</text></g>
+          <g fill="var(--text-secondary)" text-anchor="middle">
+            <text x="40" y="74">Proposal v1</text><text x="40" y="84">Priya N.</text>
+            <text x="115" y="74">Counter: 4%,</text><text x="115" y="84">drop penalty</text>
+            <text x="190" y="74">Legal review</text><text x="190" y="84">v3 terms</text>
+            <text x="262" y="74">Agreed</text><text x="262" y="84">sign by 31 Mar</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Chain timeline</h3>
+      <p>Each email in a chain as a dated point, with who sent it and what changed. Good for "how did we get here" updates.</p>
+      <div class="a-fmt"><span>SVG</span><span>PNG</span></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="people-map-svg" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="a-prev">
+        <svg viewBox="0 0 300 110" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" font-size="8">
+          <g stroke="var(--border)" stroke-width="1.5">
+            <line x1="150" y1="55" x2="60" y2="30"/><line x1="150" y1="55" x2="60" y2="85"/><line x1="150" y1="55" x2="240" y2="30"/><line x1="150" y1="55" x2="240" y2="85"/><line x1="60" y1="30" x2="60" y2="85"/>
+          </g>
+          <g stroke="var(--accent)" stroke-width="3"><line x1="150" y1="55" x2="60" y2="30"/></g>
+          <g fill="var(--bg-primary)" stroke="var(--accent)" stroke-width="1.5">
+            <circle cx="150" cy="55" r="14"/><circle cx="60" cy="30" r="12"/><circle cx="60" cy="85" r="12"/><circle cx="240" cy="30" r="12"/><circle cx="240" cy="85" r="12"/>
+          </g>
+          <g fill="var(--text-primary)" text-anchor="middle" font-size="7">
+            <text x="150" y="58">you</text><text x="60" y="33">Priya</text><text x="60" y="88">Daniel</text><text x="240" y="33">Finance</text><text x="240" y="88">Legal</text>
+          </g>
+          <g fill="var(--text-secondary)" font-size="6"><text x="98" y="36">9 emails</text><text x="98" y="78">3</text><text x="190" y="36">4</text><text x="190" y="78">2</text></g>
+        </svg>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Who-talked-to-whom map</h3>
+      <p>People and teams in the results, joined by how often they wrote to each other. The thick line is the busiest exchange.</p>
+      <div class="a-fmt"><span>SVG</span><span>PNG</span></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="brief-doc" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="a-prev a-doc">
+        <h5>Acme renewal: where we landed</h5>
+        <p>Two-year renewal agreed at a 4% uplift; the late-delivery penalty clause was dropped at Acme's request.</p>
+        <ul>
+          <li>Business sign-off: Daniel Osei, 27 Feb</li>
+          <li>Legal to countersign by 31 Mar (not yet confirmed in these results)</li>
+          <li>FY26 budget line set at €412k</li>
+        </ul>
+        <div class="src">Sources: [1] Priya Nair, 18 Mar 2026 · [2] Daniel Osei, 27 Feb 2026 · [3] Mei Lin, 9 Mar 2026</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Written brief</h3>
+      <p>A one-page summary, status update or draft reply written from the results, with a sources list you can check. Free-form instructions welcome.</p>
+      <div class="a-fmt"><span>Markdown</span><span>Word</span><span>Copy to clipboard</span></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="decisions-table" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="a-prev">
+        <table class="a-tbl">
+          <tr><th>Decision / open item</th><th>Who</th><th>Date</th><th>Source</th></tr>
+          <tr><td>Renew 2 years at 4% uplift</td><td class="m">Daniel O.</td><td class="m">27 Feb</td><td class="m">[2]</td></tr>
+          <tr><td>Penalty clause removed</td><td class="m">Priya N.</td><td class="m">18 Mar</td><td class="m">[1]</td></tr>
+          <tr><td>Legal countersign by 31 Mar</td><td class="m">Legal</td><td class="m">open</td><td class="m">[1]</td></tr>
+          <tr><td>Budget line €412k</td><td class="m">Mei Lin</td><td class="m">9 Mar</td><td class="m">[3]</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Decisions and open items table</h3>
+      <p>Every decision, owner, date and source pulled out of a chain, with open items marked. Lands in the same Excel export as search results.</p>
+      <div class="a-fmt"><span>Excel</span><span>Markdown</span></div>
+    </div>
+  </div>
+
+</div>
+
+<div class="a-how">
+  <div class="label">How these get made on a 16 GB laptop</div>
+  The local model never draws the picture. It reads the cited emails and fills in a small structure: the events for a timeline, the people and counts for a map, the decisions for a table, the outline for a brief. The library then renders that structure into SVG, Word, Excel or Markdown from a template, so the output is always well-formed, in a consistent style, and every item keeps its source email. A free-form "write me a …" request produces Markdown you can edit, and the Word export is made from that.
+</div>
+
+</div><script>window.toggleSelect=function(el){el.classList.toggle('selected');};</script></body></html>
