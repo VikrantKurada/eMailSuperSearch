@@ -284,3 +284,81 @@ def sup_with_ocr(make_supervisor, tmp_store, corpus_dir):
     s = make_supervisor(tmp_store, corpus_dir, 900, True)
     yield s
     s.stop()
+
+
+@pytest.fixture
+def host_services(tmp_path, chunker_ws):
+    """``Services`` over a fresh catalog in ``tmp_path``, keyword-only (no embedder); supervisors started through the
+    API are stopped, and the catalog closed, at teardown."""
+    from emailsupersearch.catalog import Catalog
+    from emailsupersearch.host.app import Services
+    from emailsupersearch.host.security import SessionStore, new_token
+    from emailsupersearch.host.sse import EventBus
+    from emailsupersearch.jobs.supervisor import build_project_supervisor
+
+    catalog = Catalog(tmp_path)
+    bus = EventBus()
+    services = Services(
+        catalog=catalog,
+        embedder=None,
+        chunker=chunker_ws,
+        supervisors={},
+        bus=bus,
+        launch_token=new_token(),
+        sessions=SessionStore(),
+        start_supervisor=lambda pid: build_project_supervisor(
+            pid,
+            catalog.open_store(pid),
+            None,
+            chunker_ws,
+            tmp_path / "cache" / "parsed",
+            lambda ev: bus.publish(f"sync:{pid}", ev),
+        ),
+        static_dir=None,
+        request_shutdown=lambda: None,
+        blocked_projects={},
+    )
+    yield services
+    for sup in list(services.supervisors.values()):
+        sup.stop()
+    catalog.close()
+
+
+@pytest.fixture
+def token(host_services):
+    """The host's launch token."""
+    return host_services.launch_token
+
+
+@pytest.fixture
+def raw_client(host_services):
+    """A TestClient on the host app with a loopback Host header and no cookies; the app's lifespan runs."""
+    from starlette.testclient import TestClient
+
+    from emailsupersearch.host.app import create_app
+
+    with TestClient(create_app(host_services), base_url="http://127.0.0.1") as c:
+        yield c
+
+
+@pytest.fixture
+def client_no_header(raw_client, token):
+    """``raw_client`` holding the session and CSRF cookies from ``/auth``, without the CSRF header."""
+    r = raw_client.get(f"/auth?token={token}", follow_redirects=False)
+    assert r.status_code == 303
+    return raw_client
+
+
+@pytest.fixture
+def client(client_no_header):
+    """``client_no_header`` that also sends the CSRF header on every request."""
+    client_no_header.headers["X-ESS-Token"] = client_no_header.cookies["ess_csrf"]
+    return client_no_header
+
+
+@pytest.fixture
+def project(client, corpus_dir):
+    """The id of a project over ``corpus_dir`` created through the API (its supervisor is running)."""
+    r = client.post("/api/projects", json={"name": "Corpus", "folders": [str(corpus_dir)], "language": "en"})
+    assert r.status_code == 201
+    return r.json()["id"]
