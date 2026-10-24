@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.14"
 license = "GPL-3.0-or-later"
 dependencies = [
     "extract-msg>=0.56,<0.57",
+    "chardet>=5",
     "pypdfium2>=5",
     "python-docx>=1.2",
     "openpyxl>=3.1",

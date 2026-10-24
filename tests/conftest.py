@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 
@@ -52,3 +54,13 @@ def corpus_dir(tmp_path):
 
     generate(tmp_path / "corpus", 6, seed=1)
     return tmp_path / "corpus"
+
+
+@pytest.fixture(scope="session")
+def msg_fixtures():
+    """Sorted ``.msg`` files from extract-msg's samples and the owner's own; skipped when neither exists."""
+    root = Path(__file__).resolve().parent / "fixtures"
+    found = sorted(p for sub in ("msg", "owner") for p in (root / sub).glob("*.msg"))
+    if not found:
+        pytest.skip("run scripts/fetch_fixtures.py")
+    return found
