@@ -76,7 +76,8 @@ def _under_roots(roots: Sequence[str]) -> tuple[str, list[str]]:
     """SQL condition (and its parameters) for "the path is one of ``roots`` or lies below one".
 
     A root is matched as a prefix that ends in a separator, so ``D:\\mail`` does not match ``D:\\mail-old\\x``.
-    The scanner passes roots spelled exactly as they are stored, so there is no case folding.
+    The scanner passes roots spelled as ``add_folder`` stored them (already normalised) and builds file paths by
+    joining a root with ``os.path.join``, so the two share a spelling and there is no case folding.
     """
     clauses: list[str] = []
     params: list[str] = []
@@ -89,14 +90,19 @@ def _under_roots(roots: Sequence[str]) -> tuple[str, list[str]]:
 
 
 class ProjectStore:
-    """Facade over one project's SQLite database."""
+    """Facade over one project's SQLite database.
+
+    Paths: ``add_folder`` stores each root as ``os.path.normpath(path)``, and the scanner builds every
+    ``files.path`` by joining a stored root with ``os.path.join``, so a file path shares its root's spelling.
+    Roots are matched against ``files.path`` as exact string prefixes (``_under_roots``); no case folding is applied.
+    """
 
     def __init__(self, path: Path, conn: sqlite3.Connection) -> None:
         self.path = path
         self.conn = conn
         self._lock = threading.RLock()
         self._local = threading.local()
-        self._read_conns: list[sqlite3.Connection] = []
+        self._readers: dict[threading.Thread, sqlite3.Connection] = {}
         self._closed = False
 
     @classmethod
@@ -116,31 +122,38 @@ class ProjectStore:
         """Close every connection so the database file can be deleted on Windows. Safe to call twice."""
         with self._lock:
             self._closed = True
-            for read_conn in self._read_conns:
-                read_conn.close()
-            self._read_conns.clear()
+            for reader in self._readers.values():
+                reader.close()
+            self._readers.clear()
             self.conn.close()
 
     def read_conn(self) -> sqlite3.Connection:
         """A read-only connection owned by the calling thread, for searches and route reads.
 
         It sees every committed write and cannot disturb the writer's transaction. Writes never use it.
+        The connection is opened outside the writer lock, so a thread's first read does not wait for a write.
+        Connections of threads that have exited (a server's worker pool retires idle threads) are closed
+        whenever another thread opens its own, so their number stays near the number of live threads.
         """
         conn = getattr(self._local, "conn", None)
         if conn is not None and not self._closed:
             return conn
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("the project store is closed")
-            conn = connect(self.path)
-            try:
-                conn.execute("PRAGMA query_only=1")
-            except BaseException:
-                conn.close()
-                raise
-            self._read_conns.append(conn)
-            self._local.conn = conn
-            return conn
+        if self._closed:
+            raise RuntimeError("the project store is closed")
+        conn = connect(self.path)
+        try:
+            conn.execute("PRAGMA query_only=1")
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("the project store is closed")
+                for thread in [t for t in self._readers if not t.is_alive()]:
+                    self._readers.pop(thread).close()
+                self._readers[threading.current_thread()] = conn
+        except BaseException:
+            conn.close()
+            raise
+        self._local.conn = conn
+        return conn
 
     # ---- settings ----
 
@@ -166,12 +179,12 @@ class ProjectStore:
         with self._lock, self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO folders(path, kind, last_scan_id, reachable) VALUES (?, ?, 0, 1)",
-                (path, kind),
+                (os.path.normpath(path), kind),
             )
 
     def remove_folder(self, path: str) -> None:
         with self._lock, self.conn:
-            self.conn.execute("DELETE FROM folders WHERE path = ?", (path,))
+            self.conn.execute("DELETE FROM folders WHERE path = ?", (os.path.normpath(path),))
 
     # ---- file manifest ----
 
@@ -288,10 +301,10 @@ class ProjectStore:
             self.conn.execute("DELETE FROM attachments WHERE message_key = ?", (message_key,))
             self.conn.executemany(
                 "INSERT INTO attachments(message_key, ordinal, filename, mime, size, kind, sha256, extract_status,"
-                " ocr_status, embedded_partial, page_count, text_chars) VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?, 0, ?, ?)",
+                " ocr_status, embedded_partial, page_count, text_chars) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?)",
                 [
                     (
-                        message_key, a.ordinal, a.filename, a.size, a.kind, a.status,
+                        message_key, a.ordinal, a.filename, a.size, a.kind, a.sha256, a.status,
                         ocr_status_default if a.needs_ocr_pages else "none", a.page_count, len(a.text),
                     )
                     for a in atts

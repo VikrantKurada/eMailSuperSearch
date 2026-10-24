@@ -32,8 +32,12 @@ def _chunks(*texts: str) -> list[ChunkText]:
     return [ChunkText(i, t, len(t.split())) for i, t in enumerate(texts)]
 
 
-def _att(ordinal: int, text: str = "attachment text", status: str = "ok", needs_ocr_pages=()) -> AttachmentText:
-    return AttachmentText(ordinal, f"a{ordinal}.pdf", "pdf", 1000 + ordinal, status, text, 3, list(needs_ocr_pages))
+def _att(
+    ordinal: int, text: str = "attachment text", status: str = "ok", needs_ocr_pages=(), sha256: str | None = None
+) -> AttachmentText:
+    return AttachmentText(
+        ordinal, f"a{ordinal}.pdf", "pdf", 1000 + ordinal, status, text, 3, list(needs_ocr_pages), sha256=sha256
+    )
 
 
 def _parsed_att() -> ParsedAttachment:
@@ -107,6 +111,10 @@ def test_folders_crud(tmp_path):
         store.remove_folder("D:\\mail\\b")
         assert store.list_folders() == ["\\\\srv\\share\\a"]
         store.remove_folder("not there")  # no error
+        store.add_folder("D:/x/../y", "local")  # roots are stored normalised, as file paths are joined from them
+        assert store.list_folders() == sorted(["\\\\srv\\share\\a", os.path.normpath("D:/x/../y")])
+        store.remove_folder("D:/x/../y")  # the same spelling finds the stored row
+        assert store.list_folders() == ["\\\\srv\\share\\a"]
     finally:
         store.close()
 
@@ -222,6 +230,25 @@ def test_read_conn_is_read_only_and_sees_commits(tmp_store):
     assert tmp_store.read_conn().execute("SELECT value FROM settings WHERE key = 'k'").fetchone()[0] == "2"
 
 
+def test_read_conn_reaps_connections_of_exited_threads(tmp_store):
+    opened: list[sqlite3.Connection] = []
+
+    def reader():
+        opened.append(tmp_store.read_conn())
+
+    for _ in range(6):  # a worker pool retires idle threads, so bursts of searches arrive on fresh threads
+        thread = threading.Thread(target=reader)
+        thread.start()
+        thread.join()
+    assert len(opened) == 6 and len(tmp_store._readers) <= 2
+    for dead in opened[:5]:  # reaped by the next thread's first read_conn()
+        with pytest.raises(sqlite3.ProgrammingError):
+            dead.execute("SELECT 1")
+    tmp_store.set_setting("k", 1)
+    assert tmp_store.read_conn().execute("SELECT value FROM settings WHERE key = 'k'").fetchone()[0] == "1"
+    assert len(tmp_store._readers) <= 2
+
+
 def test_read_conn_does_not_commit_the_writers_transaction(tmp_store):
     with pytest.raises(RuntimeError, match="boom"), tmp_store._lock, tmp_store.conn:
         tmp_store.conn.execute("INSERT INTO settings(key, value) VALUES ('half', '1')")
@@ -277,13 +304,13 @@ def test_upsert_message_replaces_recipients(tmp_store, parsed_factory):
 
 
 def test_attachments_upsert_and_status(tmp_store):
-    atts = [_att(0), _att(1, text="", status="needs_ocr", needs_ocr_pages=[1, 2])]
+    atts = [_att(0, sha256="abc123"), _att(1, text="", status="needs_ocr", needs_ocr_pages=[1, 2])]
     tmp_store.upsert_attachments("m1", atts, "pending")
     tmp_store.upsert_attachments("other", [_att(0)], "pending")
     sql = "SELECT * FROM attachments WHERE message_key = 'm1' ORDER BY ordinal"
     rows = tmp_store.conn.execute(sql).fetchall()
     assert [(r["ordinal"], r["filename"], r["mime"], r["size"], r["kind"], r["sha256"]) for r in rows] == [
-        (0, "a0.pdf", None, 1000, "pdf", None),
+        (0, "a0.pdf", None, 1000, "pdf", "abc123"),
         (1, "a1.pdf", None, 1001, "pdf", None),
     ]
     assert [(r["extract_status"], r["ocr_status"], r["embedded_partial"]) for r in rows] == [
