@@ -15,11 +15,11 @@ from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 import extract_msg
-from extract_msg.enums import AttachmentType, RecipientType
+from extract_msg.enums import AttachmentType, ErrorBehavior, RecipientType
 from extract_msg.msg_classes import MessageBase
 from extract_msg.null_date import NullDate
 
-from emailsupersearch.ingest.eml_adapter import _kind_for
+from emailsupersearch.ingest.eml_adapter import _kind_for, html_to_text
 from emailsupersearch.types import ParsedAttachment, ParsedMessage, Recipient
 
 MSG_CONVERSATION_INDEX_STREAM = "__substg1.0_00710102"
@@ -38,6 +38,11 @@ _CODEPAGE_CODECS = {28590 + n: f"iso8859-{n}" for n in range(1, 10)} | {28605: "
 def _clean(value: str | None) -> str:
     """A string stream value without the NUL padding some writers leave behind."""
     return (value or "").replace("\x00", "")
+
+
+def _text(value: str | None) -> str:
+    """A string stream value as text with LF line breaks, whatever the sender's mail client used."""
+    return _clean(value).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _clean_id(value: str | None) -> str | None:
@@ -88,10 +93,22 @@ def _sender(msg: MessageBase) -> tuple[str, str]:
     return (name if "<" in raw else raw), ""  # a bare display name or an Exchange alias is not an address
 
 
-def _references(msg: MessageBase) -> list[str]:
-    raw = " ".join(_clean(str(v)) for v in msg.header.get_all("References") or [])
+def _id_tokens(raw: str) -> list[str]:
     tokens = re.findall(r"<[^<>]*>", raw) or raw.split()  # folding can put a line break inside one id
     return [i for i in (_clean_id(t) for t in tokens) if i]
+
+
+def _references(msg: MessageBase) -> list[str]:
+    return _id_tokens(" ".join(_clean(str(v)) for v in msg.header.get_all("References") or []))
+
+
+def _in_reply_to(msg: MessageBase) -> str | None:
+    """The In-Reply-To stream, else the first id of the transport header's In-Reply-To."""
+    from_stream = _clean_id(msg.inReplyTo)
+    if from_stream:
+        return from_stream
+    header = msg.header["In-Reply-To"]
+    return next(iter(_id_tokens(_clean(str(header)))), None) if header is not None else None
 
 
 def _recipients(msg: MessageBase) -> list[Recipient]:
@@ -174,11 +191,11 @@ def _strip_rtf(rtf: bytes) -> str:
 
 def _body_text(msg: MessageBase) -> str:
     """The plain-text body; a message that only has an RTF body gets its text from that."""
-    body = _clean(_optional(lambda: msg.body))  # None when extract-msg could not de-encapsulate the RTF
+    body = _text(_optional(lambda: msg.body))  # None when extract-msg could not de-encapsulate the RTF
     if body.strip():
         return body
     rtf = _optional(lambda: msg.rtfBody)
-    return _clean(_strip_rtf(rtf)) if rtf else body
+    return _text(_strip_rtf(rtf)) if rtf else body
 
 
 def _decode_html(raw: bytes, codepage: object) -> str:
@@ -227,6 +244,8 @@ def _attachments(msg: MessageBase, depth: int) -> list[ParsedAttachment]:
 def _convert(msg: MessageBase, depth: int) -> ParsedMessage:
     """Turn an open message into a ``ParsedMessage``.
 
+    ``body_text`` is the plain body, else the text of the RTF body, else the text of the HTML body.
+
     ``sent_ts`` is left ``None`` with ``date_source="none"`` when the message carries no date at all;
     ``parse_msg`` then substitutes the file's mtime for the top-level message.
     """
@@ -239,27 +258,35 @@ def _convert(msg: MessageBase, depth: int) -> ParsedMessage:
         sent_ts, date_source = _header_ts(msg), "header_date"
     if sent_ts is None:
         date_source = "none"
+    body_html = _body_html(msg)
+    body_text = _body_text(msg)
+    if not body_text.strip() and body_html:
+        body_text = html_to_text(body_html)
     return ParsedMessage(
         message_id=_clean_id(msg.messageId),
-        subject=_clean(msg.subject),
+        subject=_text(msg.subject),
         sender_name=sender_name,
         sender_addr=sender_addr,
         recipients=_recipients(msg),
         sent_ts=sent_ts,
         received_ts=received_ts,
         date_source=date_source,
-        body_text=_body_text(msg),
-        body_html=_body_html(msg),
-        in_reply_to=_clean_id(msg.inReplyTo),
+        body_text=body_text,
+        body_html=body_html,
+        in_reply_to=_in_reply_to(msg),
         references=_references(msg),
         conversation_index=msg.getStream(MSG_CONVERSATION_INDEX_STREAM),
-        conversation_topic=_clean(msg.getStringStream(MSG_CONVERSATION_TOPIC_STREAM)).strip() or None,
+        conversation_topic=_text(msg.getStringStream(MSG_CONVERSATION_TOPIC_STREAM)).strip() or None,
         attachments=_attachments(msg, depth),
     )
 
 
 def _open_and_convert(path: Path, **options: str) -> ParsedMessage:
-    with extract_msg.openMsg(str(path), delayAttachments=True, **options) as msg:
+    # SUPPRESS_ALL turns a damaged or unsupported attachment into an extract-msg BrokenAttachment or
+    # UnsupportedAttachment (kind "other" here) instead of an exception that would fail the whole file.
+    with extract_msg.openMsg(
+        str(path), delayAttachments=True, errorBehavior=ErrorBehavior.SUPPRESS_ALL, **options
+    ) as msg:
         return _convert(msg, 0)
 
 

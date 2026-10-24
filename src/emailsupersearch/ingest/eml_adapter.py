@@ -103,7 +103,8 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
 
-def _html_to_text(html: str) -> str:
+def html_to_text(html: str) -> str:
+    """Visible text of an HTML document: block tags become line breaks, table cells spaces."""
     parser = _TextExtractor()
     parser.feed(html)
     parser.close()
@@ -222,7 +223,7 @@ def _convert(msg: EmailMessage, mtime: int) -> ParsedMessage:
     if plain is not None:
         body_text = _text_of(plain)
     else:
-        body_text = _html_to_text(body_html) if body_html else ""
+        body_text = html_to_text(body_html) if body_html else ""
     return ParsedMessage(
         message_id=next(iter(_ids(msg, "Message-ID")), None),
         subject=str(msg["Subject"] or ""),

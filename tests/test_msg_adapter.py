@@ -70,9 +70,11 @@ def _add_message(
     subject: str,
     *,
     body: str | None = None,
+    html: str | None = None,
     rtf: bytes | None = None,
     header: str | None = None,
     in_reply_to: str | None = None,
+    topic: str | None = None,
     sent: datetime | None = None,
     received: datetime | None = None,
     attachments: tuple = (),
@@ -89,23 +91,26 @@ def _add_message(
     counts = b"\x00" * 8 + struct.pack("<IIII", 0, count, 0, count) + (b"" if prefix else b"\x00" * 8)
     out.addEntry(f"{prefix}__properties_version1.0", counts + b"".join(entries))
     suffix, codec = ("001E", "cp1251") if cp1251_labelled_utf8 else ("001F", "utf-16-le")
-    strings = {"001A": "IPM.Note", "0037": subject, "1000": body, "007D": header, "1042": in_reply_to}
+    strings = {"001A": "IPM.Note", "0037": subject, "1000": body, "007D": header, "1042": in_reply_to, "0070": topic}
     for prop_id, text in strings.items():
         if text is not None:
             out.addEntry(f"{prefix}__substg1.0_{prop_id}{suffix}", text.encode(codec))
+    if html is not None:
+        out.addEntry(f"{prefix}__substg1.0_10130102", html.encode("utf-8"))
     if rtf is not None:
         out.addEntry(f"{prefix}__substg1.0_10090102", compressed_rtf.compress(rtf))
     for number, (kind, filename, content, content_id) in enumerate(attachments):
         att = f"{prefix}__attach_version1.0_#{number:08X}/"
-        method = 1 if kind == "data" else 5
+        method = 5 if kind == "msg" else 1
         out.addEntry(f"{att}__properties_version1.0", b"\x00" * 8 + _prop(0x3705, 3, struct.pack("<i", method)))
         out.addEntry(f"{att}__substg1.0_3707001F", filename.encode("utf-16-le"))
         if kind == "data":
             out.addEntry(f"{att}__substg1.0_37010102", content)
             if content_id:
                 out.addEntry(f"{att}__substg1.0_3712001F", content_id.encode("utf-16-le"))
-        else:  # ``content`` holds the embedded message's own fields
+        elif kind == "msg":  # ``content`` holds the embedded message's own fields
             _add_message(out, f"{att}__substg1.0_3701000D/", **content)
+        # "broken": a by-value attachment without its data stream, which extract-msg rejects
 
 
 def make_msg(path: Path, subject: str, **fields) -> Path:
@@ -155,11 +160,51 @@ def test_parse_msg_date_source_order(tmp_path, fields, source, expected):
 
 
 def test_parse_msg_ids_lose_brackets_and_references_are_split(tmp_path):
-    header = "Message-ID: <abc@example.com>\r\nReferences: <r1@example.com>\r\n\t<r2@example.com>\r\nSubject: x\r\n"
+    header = (
+        "Message-ID: <abc@example.com>\r\nIn-Reply-To: <from-header@example.com>\r\n"
+        "References: <r1@example.com>\r\n\t<r2@example.com>\r\nSubject: x\r\n"
+    )
     m = parse_msg(make_msg(tmp_path / "ids.msg", "ids", header=header, in_reply_to="<r2@example.com>"))
     assert m.message_id == "abc@example.com"
-    assert m.in_reply_to == "r2@example.com"
+    assert m.in_reply_to == "r2@example.com"  # the stream wins over the header
     assert m.references == ["r1@example.com", "r2@example.com"]
+
+
+def test_parse_msg_in_reply_to_falls_back_to_the_first_header_id(tmp_path):
+    header = "In-Reply-To: <first@example.com>\r\n\t<second@example.com>\r\nSubject: x\r\n"
+    m = parse_msg(make_msg(tmp_path / "irt.msg", "no 0x1042 stream", header=header))
+    assert m.in_reply_to == "first@example.com"
+    assert parse_msg(make_msg(tmp_path / "none.msg", "no header either")).in_reply_to is None
+
+
+def test_parse_msg_text_fields_use_lf_line_breaks(tmp_path):
+    p = make_msg(tmp_path / "crlf.msg", "one\r\ntwo", body="a\r\nb\rc\r\n", topic="topic\r\nline")
+    m = parse_msg(p)
+    assert m.body_text == "a\nb\nc\n"
+    assert m.subject == "one\ntwo" and m.conversation_topic == "topic\nline"
+    assert "\r" not in m.body_text + m.subject + m.conversation_topic
+
+
+def test_parse_msg_html_only_message_gets_text_from_the_html(tmp_path):
+    html = "<html><body><p>Quarterly <b>budget</b></p><table><tr><td>Name</td><td>Value</td></tr></table></body></html>"
+    m = parse_msg(make_msg(tmp_path / "html.msg", "HTML only", html=html))
+    assert m.body_html == html
+    assert m.body_text == "Quarterly budget\n\nName Value"
+
+
+def test_parse_msg_damaged_attachment_degrades_to_other(tmp_path):
+    attachments = (
+        ("data", "first.pdf", b"%PDF-1.4", None),
+        ("broken", "damaged.bin", None, None),
+        ("data", "last.png", b"\x89PNG", None),
+    )
+    m = parse_msg(make_msg(tmp_path / "broken.msg", "damaged attachment", attachments=attachments))
+    assert [(a.ordinal, a.filename, a.kind) for a in m.attachments] == [
+        (0, "first.pdf", "pdf"),
+        (1, "damaged.bin", "other"),
+        (2, "last.png", "image"),
+    ]
+    assert m.attachments[1].data is None and m.attachments[1].size == 0
 
 
 def test_parse_msg_data_attachment_keeps_bytes_and_content_id(tmp_path):
