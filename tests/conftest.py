@@ -3,19 +3,43 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(scope="session")
-def embedder():
-    """The real int8 MiniLM embedder; skipped when the model files have not been fetched."""
+def _model_dir_or_skip() -> Path:
+    """The fetched embedding model directory, or skip the test when its files are missing."""
     try:
         import emailsupersearch_models_en as models
     except ImportError:
         pytest.skip("run scripts/fetch_models.py")
-    from emailsupersearch.index.embedder import OnnxEmbedder, tokenizer_path
+    from emailsupersearch.index.embedder import tokenizer_path
 
     model_dir = models.embedding_dir()
     if not (model_dir / "model.onnx").is_file() or not tokenizer_path(model_dir).is_file():
         pytest.skip("run scripts/fetch_models.py")
-    return OnnxEmbedder(model_dir)
+    return model_dir
+
+
+@pytest.fixture(scope="session")
+def embedder():
+    """The real int8 MiniLM embedder; skipped when the model files have not been fetched."""
+    from emailsupersearch.index.embedder import OnnxEmbedder
+
+    return OnnxEmbedder(_model_dir_or_skip())
+
+
+@pytest.fixture(scope="session")
+def chunker():
+    """A chunker that counts the real MiniLM word pieces; skipped when the model files have not been fetched."""
+    from emailsupersearch.index.embedder import tokenizer_path
+    from emailsupersearch.ingest.chunker import Chunker
+
+    return Chunker(tokenizer_path(_model_dir_or_skip()))
+
+
+@pytest.fixture(scope="session")
+def chunker_ws():
+    """The keyword-only install's chunker: a token is a whitespace-separated word."""
+    from emailsupersearch.ingest.chunker import Chunker
+
+    return Chunker(None)
 
 
 @pytest.fixture
