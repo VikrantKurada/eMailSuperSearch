@@ -117,3 +117,14 @@ def eml_doc_with_image(tmp_path):
         if any(a.kind == "image" for a in doc.attachments):
             return doc
     raise AssertionError("the corpus has no message with an image attachment")
+
+
+@pytest.fixture
+def tmp_store(tmp_path, corpus_dir):
+    """A fresh ProjectStore under ``tmp_path / "proj"`` that watches the synthetic corpus folder."""
+    from emailsupersearch.store import ProjectStore
+
+    store = ProjectStore.open(tmp_path / "proj")
+    store.add_folder(str(corpus_dir), "local")
+    yield store
+    store.close()
