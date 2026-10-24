@@ -27,6 +27,10 @@ MSG_CONVERSATION_TOPIC_STREAM = "__substg1.0_0070"
 MSG_ATTACH_CONTENT_ID_STREAM = "__substg1.0_3712"
 
 _MAX_NESTING = 3  # a message nested deeper than this keeps its attachment entry but gets no ``nested``
+# Everything extract-msg can suppress, so one damaged or unsupported attachment becomes a BrokenAttachment
+# or UnsupportedAttachment (kind "other" here) instead of failing the whole file, except OLE_DEFECT_INCORRECT:
+# it relaxes olefile's defect level, and a truncated file would then parse with silently shortened data.
+_ERROR_BEHAVIOR = ErrorBehavior.SUPPRESS_ALL & ~ErrorBehavior.OLE_DEFECT_INCORRECT
 _PR_INTERNET_CPID = "3FDE0003"
 _PR_ATTACH_SIZE = "0E200003"
 _RECIPIENT_KINDS = {RecipientType.TO: "to", RecipientType.CC: "cc", RecipientType.BCC: "bcc"}
@@ -282,11 +286,7 @@ def _convert(msg: MessageBase, depth: int) -> ParsedMessage:
 
 
 def _open_and_convert(path: Path, **options: str) -> ParsedMessage:
-    # SUPPRESS_ALL turns a damaged or unsupported attachment into an extract-msg BrokenAttachment or
-    # UnsupportedAttachment (kind "other" here) instead of an exception that would fail the whole file.
-    with extract_msg.openMsg(
-        str(path), delayAttachments=True, errorBehavior=ErrorBehavior.SUPPRESS_ALL, **options
-    ) as msg:
+    with extract_msg.openMsg(str(path), delayAttachments=True, errorBehavior=_ERROR_BEHAVIOR, **options) as msg:
         return _convert(msg, 0)
 
 

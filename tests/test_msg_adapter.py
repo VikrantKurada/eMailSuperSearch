@@ -75,6 +75,10 @@ def _add_message(
     header: str | None = None,
     in_reply_to: str | None = None,
     topic: str | None = None,
+    conversation_index: bytes | None = None,
+    sender_name: str | None = None,
+    sender_addr: str | None = None,
+    recipients: tuple = (),
     sent: datetime | None = None,
     received: datetime | None = None,
     attachments: tuple = (),
@@ -87,14 +91,22 @@ def _add_message(
     for prop_id, when in ((0x0039, sent), (0x0E06, received)):
         if when is not None:
             entries.append(_prop(prop_id, 0x40, _filetime(when)))
-    count = len(attachments)
-    counts = b"\x00" * 8 + struct.pack("<IIII", 0, count, 0, count) + (b"" if prefix else b"\x00" * 8)
+    n_att, n_rcpt = len(attachments), len(recipients)
+    counts = b"\x00" * 8 + struct.pack("<IIII", n_rcpt, n_att, n_rcpt, n_att) + (b"" if prefix else b"\x00" * 8)
     out.addEntry(f"{prefix}__properties_version1.0", counts + b"".join(entries))
     suffix, codec = ("001E", "cp1251") if cp1251_labelled_utf8 else ("001F", "utf-16-le")
     strings = {"001A": "IPM.Note", "0037": subject, "1000": body, "007D": header, "1042": in_reply_to, "0070": topic}
+    strings |= {"0C1A": sender_name, "5D01": sender_addr}
     for prop_id, text in strings.items():
         if text is not None:
             out.addEntry(f"{prefix}__substg1.0_{prop_id}{suffix}", text.encode(codec))
+    if conversation_index is not None:
+        out.addEntry(f"{prefix}__substg1.0_00710102", conversation_index)
+    for number, (rcpt_type, name, address) in enumerate(recipients):
+        rcpt = f"{prefix}__recip_version1.0_#{number:08X}/"
+        out.addEntry(f"{rcpt}__properties_version1.0", b"\x00" * 8 + _prop(0x0C15, 3, struct.pack("<i", rcpt_type)))
+        out.addEntry(f"{rcpt}__substg1.0_3001001F", name.encode("utf-16-le"))
+        out.addEntry(f"{rcpt}__substg1.0_39FE001F", address.encode("utf-16-le"))
     if html is not None:
         out.addEntry(f"{prefix}__substg1.0_10130102", html.encode("utf-8"))
     if rtf is not None:
@@ -246,3 +258,102 @@ def test_parse_file_wraps_adapter_errors(tmp_path):
 def test_parse_file_dispatches_on_suffix(tmp_path, corpus_dir):
     assert parse_file(next(corpus_dir.glob("*.eml"))).subject
     assert parse_file(make_msg(tmp_path / "UPPER.MSG", "upper")).subject == "upper"
+
+
+def _sample(msg_fixtures, name: str) -> Path:
+    found = next((p for p in msg_fixtures if p.name == name), None)
+    if found is None:
+        pytest.skip(f"{name} not fetched")
+    return found
+
+
+def test_parse_msg_sample_recipients_sender_and_conversation_fields(msg_fixtures):
+    m = parse_msg(_sample(msg_fixtures, "multi-to.msg"))
+    # The file lists Alice (To), Dave (Cc), Carol (To), then Alice and Dave once more.
+    assert [(r.kind, r.name, r.addr) for r in m.recipients] == [
+        ("to", "Alice Smith", "alice@example.com"),
+        ("cc", "Dave Jones", "dave@example.com"),
+        ("to", "Carol Wilson", "carol@example.com"),
+        ("to", "Alice Smith", "alice@example.com"),
+        ("cc", "Dave Jones", "dave@example.com"),
+    ]
+    assert (m.sender_name, m.sender_addr) == ("Bob Sender", "bob@example.com")
+    assert m.conversation_index == bytes.fromhex("010189833d862a66781086d37a839975026a0ac9967a0228ac1d9e01d8b9d676")
+    assert m.conversation_topic == "Test: multiple To recipients"
+    other = parse_msg(_sample(msg_fixtures, "unicode.msg"))
+    assert other.conversation_index == bytes.fromhex("01021a170704432903788667ec3dae49a04d7733109d")
+    assert len(other.conversation_index) == 22 and other.conversation_topic == "Test for TIF files"
+
+
+def test_parse_msg_recipient_types_map_to_to_cc_bcc(tmp_path):
+    recipients = (
+        (1, "Ann Lee", "ann@example.com"),
+        (2, "Cy Dunn", "cy@example.com"),
+        (3, "Bo Hidden", "bo@example.org"),
+        (0, "Sender Echo", "echo@example.com"),  # a sender-type entry is not a recipient
+    )
+    m = parse_msg(make_msg(tmp_path / "r.msg", "recipients", recipients=recipients))
+    assert [(r.kind, r.name, r.addr) for r in m.recipients] == [
+        ("to", "Ann Lee", "ann@example.com"),
+        ("cc", "Cy Dunn", "cy@example.com"),
+        ("bcc", "Bo Hidden", "bo@example.org"),
+    ]
+
+
+def test_parse_msg_conversation_fields_come_from_their_streams(tmp_path):
+    index = bytes(range(22))
+    m = parse_msg(make_msg(tmp_path / "c.msg", "not the topic", topic="Quarterly budget", conversation_index=index))
+    assert m.conversation_index == index
+    assert m.conversation_topic == "Quarterly budget"
+    bare = parse_msg(make_msg(tmp_path / "bare.msg", "no conversation fields"))
+    assert bare.conversation_index is None and bare.conversation_topic is None
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"sender_name": "Jane Doe", "sender_addr": "jane@example.com"}, ("Jane Doe", "jane@example.com")),
+        ({"header": 'From: "Doe, Jane" <jane@example.com>\r\nSubject: x\r\n'}, ("Doe, Jane", "jane@example.com")),
+        ({"sender_name": "Facilities Desk"}, ("Facilities Desk", "")),  # a name without an address
+        ({}, ("", "")),
+    ],
+)
+def test_parse_msg_sender_name_and_address(tmp_path, fields, expected):
+    m = parse_msg(make_msg(tmp_path / "s.msg", "sender", **fields))
+    assert (m.sender_name, m.sender_addr) == expected
+
+
+def test_parse_msg_nested_message_without_a_date_has_no_timestamp(tmp_path):
+    attachments = (("msg", "inner.msg", {"subject": "inner", "body": "no date here"}, None),)
+    m = parse_msg(make_msg(tmp_path / "outer.msg", "outer", sent=_SENT, attachments=attachments))
+    inner = m.attachments[0].nested
+    assert (m.date_source, m.sent_ts) == ("sent", int(_SENT.timestamp()))
+    assert (inner.subject, inner.sent_ts, inner.date_source) == ("inner", None, "none")
+
+
+@pytest.mark.parametrize("cut", [600, 2000, 5000])
+def test_parse_file_rejects_a_truncated_file(tmp_path, cut):
+    fields = {"body": "text " * 50, "attachments": (("data", "a.bin", b"x" * 3000, None),)}
+    whole = make_msg(tmp_path / "whole.msg", "whole", **fields).read_bytes()
+    assert parse_file(tmp_path / "whole.msg").attachments[0].size == 3000
+    short = tmp_path / "short.msg"
+    short.write_bytes(whole[:-cut])
+    with pytest.raises(ParseError, match="OLE"):
+        parse_file(short)
+
+
+@pytest.mark.parametrize("cut", [10_000, 300_000])
+def test_parse_file_rejects_a_truncated_sample(msg_fixtures, tmp_path, cut):
+    short = tmp_path / "short.msg"
+    short.write_bytes(_sample(msg_fixtures, "unicode.msg").read_bytes()[:-cut])
+    with pytest.raises(ParseError):
+        parse_file(short)
+
+
+def test_parse_msg_truncated_attachment_data_is_never_returned_shortened(tmp_path):
+    payload = bytes(range(256)) * 800
+    whole = make_msg(tmp_path / "big.msg", "big", attachments=(("data", "big.pdf", payload, None),)).read_bytes()
+    short = tmp_path / "short.msg"
+    short.write_bytes(whole[:-5000])
+    att = parse_msg(short).attachments[0]
+    assert (att.kind, att.data, att.size) == ("other", None, 0)  # a damaged attachment, not a shorter pdf
