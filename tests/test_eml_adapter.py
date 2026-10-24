@@ -153,6 +153,16 @@ def test_html_only_body_is_tag_stripped(tmp_path):
     assert parsed.body_text.splitlines() == ["Hello", "", "World & co", "line two"]
 
 
+def test_html_fallback_separates_table_cells(tmp_path):
+    m = base_message()
+    m.set_content(
+        "<table><tr><td>Name</td><td>Value</td></tr><tr><th>A</th><th>B</th></tr></table>", subtype="html"
+    )
+    text = parse_eml(write(tmp_path, m)).body_text
+    assert text.split() == ["Name", "Value", "A", "B"]
+    assert [line for line in text.splitlines() if line] == ["Name Value", "A B"]
+
+
 def test_plain_part_wins_and_html_is_kept_alongside(tmp_path):
     m = base_message()
     m.set_content("plain version")

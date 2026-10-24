@@ -46,6 +46,9 @@ _BLOCK_TAGS = frozenset([
     "hr", "li", "ol", "p", "pre", "table", "tr", "ul",
 ])
 # fmt: on
+_CELL_TAGS = frozenset(
+    ["td", "th"]
+)  # a space on both sides, so "<td>Name</td><td>Value</td>" stays two words
 
 
 def _strip_brackets(token: str) -> str:
@@ -72,7 +75,7 @@ def _ids(msg: EmailMessage, name: str) -> list[str]:
 
 
 class _TextExtractor(HTMLParser):
-    """Collect the visible text of an HTML document; block-level tags become line breaks."""
+    """Collect the visible text of an HTML document: block tags become line breaks, table cells spaces."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -84,12 +87,16 @@ class _TextExtractor(HTMLParser):
             self._skip += 1
         elif tag in _BLOCK_TAGS:
             self.parts.append("\n")
+        elif tag in _CELL_TAGS:
+            self.parts.append(" ")
 
     def handle_endtag(self, tag):
         if tag in ("script", "style"):
             self._skip = max(0, self._skip - 1)
         elif tag in _BLOCK_TAGS:
             self.parts.append("\n")
+        elif tag in _CELL_TAGS:
+            self.parts.append(" ")
 
     def handle_data(self, data):
         if not self._skip:
