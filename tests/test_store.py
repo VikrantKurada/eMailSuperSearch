@@ -228,6 +228,36 @@ def test_update_file_scan_fields_changes_only_the_scans_columns(tmp_store, corpu
     tmp_store.update_file_scan_fields([])
 
 
+def test_set_file_parse_result_changes_only_the_pipelines_columns(tmp_store, corpus_dir):
+    a, missing = (os.path.join(str(corpus_dir), name) for name in ("a.eml", "missing.eml"))
+    tmp_store.upsert_file(_rec(a, sha256="aa", file_id="f1", parse_status="pending", last_seen_scan_id=3))
+    tmp_store.set_file_parse_result(a, "m1", "indexed_partial", "1 attachments not indexed")
+    assert tmp_store.get_file(a) == _rec(
+        a, sha256="aa", file_id="f1", message_key="m1", parse_status="indexed_partial",
+        status_reason="1 attachments not indexed", last_seen_scan_id=3,
+    )
+    tmp_store.set_file_parse_result(a, None, "failed", "timeout")
+    rec = tmp_store.get_file(a)
+    assert (rec.message_key, rec.parse_status, rec.status_reason, rec.sha256) == (None, "failed", "timeout", "aa")
+    tmp_store.set_file_parse_result(missing, "m2", "indexed", "")  # a path with no row: nothing is created
+    assert tmp_store.get_file(missing) is None and _count(tmp_store, "SELECT COUNT(*) FROM files") == 1
+
+
+def test_delete_file_and_message_keys_for_sha256(tmp_store, corpus_dir):
+    a, b, c, d, gone = (os.path.join(str(corpus_dir), f"{n}.eml") for n in ("a", "b", "c", "d", "gone"))
+    tmp_store.upsert_file(_rec(a, sha256="s1", message_key="m2"))
+    tmp_store.upsert_file(_rec(b, sha256="s1", message_key="m1"))
+    tmp_store.upsert_file(_rec(c, sha256="s1", message_key="m1"))  # an exact copy of b
+    tmp_store.upsert_file(_rec(d, sha256="s1", message_key=None, parse_status="failed"))
+    tmp_store.upsert_file(_rec(gone, sha256="s1", message_key="m3", tombstoned_at=5))
+    assert tmp_store.message_keys_for_sha256("s1") == ["m1", "m2"]  # live, linked, distinct, sorted
+    assert tmp_store.message_keys_for_sha256("other") == []
+    tmp_store.delete_file(a)
+    tmp_store.delete_file(os.path.join(str(corpus_dir), "never.eml"))  # no row: no error
+    assert tmp_store.get_file(a) is None and tmp_store.get_file(b) is not None
+    assert tmp_store.message_keys_for_sha256("s1") == ["m1"]
+
+
 def test_file_id_lookup_uses_an_index(tmp_store):
     plan = tmp_store.conn.execute(
         "EXPLAIN QUERY PLAN SELECT * FROM files WHERE file_id = ? ORDER BY path LIMIT 1", ("x",)
@@ -435,6 +465,17 @@ def test_replace_chunks_returns_rowids_and_deletes_old(tmp_store, parsed_factory
     assert tmp_store.chunk_rowids("m2") == other  # another message's chunks are untouched
     assert tmp_store.replace_chunks("m1", "body", []) == []
     assert tmp_store.chunk_rowids("m1") == att0
+
+
+def test_chunk_parts_lists_the_distinct_parts_of_a_message(tmp_store):
+    tmp_store.replace_chunks("m1", "body", _chunks("one", "two"))
+    tmp_store.replace_chunks("m1", "att:1", _chunks("three"))
+    tmp_store.replace_chunks("m1", "att:0", _chunks("four", "five"))
+    tmp_store.replace_chunks("m2", "att:7", _chunks("elsewhere"))
+    assert tmp_store.chunk_parts("m1") == ["att:0", "att:1", "body"]
+    tmp_store.replace_chunks("m1", "att:1", [])
+    assert tmp_store.chunk_parts("m1") == ["att:0", "body"]
+    assert tmp_store.chunk_parts("none") == []
 
 
 def test_delete_message_removes_chunks_and_vec_rows(tmp_store, parsed_factory, corpus_dir):

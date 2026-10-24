@@ -147,3 +147,48 @@ def store_with_chunks(tmp_store):
     chunks = [ChunkText(idx, text, len(text.split())) for idx, text in enumerate(texts)]
     rowids = tmp_store.replace_chunks("m-fts", "body", chunks)
     return SimpleNamespace(store=tmp_store, conn=tmp_store.conn, rowids=rowids, invoice_rowid=rowids[3])
+
+
+@pytest.fixture(scope="session")
+def parse_pool():
+    """One parse worker pool for the whole session; its workers are killed at teardown."""
+    from emailsupersearch.ingest.workers import ParsePool
+
+    pool = ParsePool()
+    yield pool
+    pool.close()
+
+
+@pytest.fixture(scope="session")
+def embedder_or_none():
+    """The real embedder when the models package is installed, else None (the keyword-only install)."""
+    from emailsupersearch.index.embedder import load_default_embedder
+
+    return load_default_embedder()
+
+
+def _make_pipeline(store, cache_dir, chunker, embedder, pool, enqueue_ocr):
+    from emailsupersearch.index.vectors import VectorIndex
+    from emailsupersearch.ingest.parse_cache import ParseCache
+    from emailsupersearch.ingest.pipeline import IngestPipeline
+
+    vectors = VectorIndex(store.conn) if embedder is not None else None
+    return IngestPipeline(store, ParseCache(cache_dir), pool, chunker, embedder, vectors, enqueue_ocr=enqueue_ocr)
+
+
+@pytest.fixture
+def pipeline(tmp_store, tmp_path, chunker, embedder_or_none, parse_pool):
+    """An ingest pipeline over ``tmp_store`` with no OCR engine; it embeds when the models are installed."""
+    return _make_pipeline(tmp_store, tmp_path / "cache", chunker, embedder_or_none, parse_pool, None)
+
+
+@pytest.fixture
+def pipeline_with_queue(tmp_store, tmp_path, chunker, embedder_or_none, parse_pool):
+    """``pipeline`` with an OCR queue: every job it enqueues is appended to ``pipeline_with_queue.jobs``."""
+    jobs: list[dict] = []
+    pipeline = _make_pipeline(
+        tmp_store, tmp_path / "cache", chunker, embedder_or_none, parse_pool,
+        lambda payload: (jobs.append(payload), len(jobs))[1],
+    )
+    pipeline.jobs = jobs
+    return pipeline

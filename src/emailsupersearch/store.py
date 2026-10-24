@@ -326,6 +326,34 @@ class ProjectStore:
                 self.conn.execute(f"DELETE FROM files WHERE path IN ({_marks(len(batch))})", tuple(batch))
         return purged
 
+    def set_file_parse_result(
+        self, path: str, message_key: str | None, parse_status: str, status_reason: str
+    ) -> None:
+        """Record what the ingest pipeline made of the file at ``path``: the message it holds, its status and reason.
+
+        Only those pipeline-owned columns change; the scan owns the others. A path with no manifest row is left alone.
+        """
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE files SET message_key = ?, parse_status = ?, status_reason = ? WHERE path = ?",
+                (message_key, parse_status, status_reason, path),
+            )
+
+    def delete_file(self, path: str) -> None:
+        """Drop the manifest row at ``path``; the message it linked to is the caller's to keep or remove."""
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+
+    def message_keys_for_sha256(self, sha256: str) -> list[str]:
+        """The distinct message keys linked to live files whose bytes hash to ``sha256``, sorted."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT message_key FROM files"
+                " WHERE sha256 = ? AND tombstoned_at IS NULL AND message_key IS NOT NULL ORDER BY message_key",
+                (sha256,),
+            )
+            return [r["message_key"] for r in rows]
+
     def paths_for_message(self, message_key: str, live_only: bool = True) -> list[str]:
         sql = "SELECT path FROM files WHERE message_key = ?"
         if live_only:
@@ -447,6 +475,14 @@ class ProjectStore:
         with self._lock:
             rows = self.conn.execute("SELECT id FROM chunks WHERE message_key = ? ORDER BY part, idx", (message_key,))
             return [r["id"] for r in rows]
+
+    def chunk_parts(self, message_key: str) -> list[str]:
+        """The distinct parts (``body``, ``att:<ordinal>``) the message has chunks for, sorted."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT part FROM chunks WHERE message_key = ? ORDER BY part", (message_key,)
+            )
+            return [r["part"] for r in rows]
 
     # ---- counts ----
 
