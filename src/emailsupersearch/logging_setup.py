@@ -4,17 +4,17 @@ import hashlib
 import logging
 import os
 import re
-from collections.abc import Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 PATH_RE = re.compile(
-    r'(?:[A-Za-z]:|\\\\[^\\\s]+)(?:\\[^\\/:*?"<>|\r\n]+)+\.(?:msg|eml|pdf|docx|xlsx|xlsm|pptx)\b',
+    r'(?:[A-Za-z]:|\\\\+[^\\\s]+)(?:\\+[^\\/:*?"<>|\r\n]+)+\.(?:msg|eml|pdf|docx|xlsx|xlsm|pptx)\b',
     re.IGNORECASE,
 )
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+LOGGER_NAME = "emailsupersearch"
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _MAX_BYTES = 5 * 1024 * 1024
 _BACKUP_COUNT = 3
 
@@ -33,16 +33,23 @@ def redact(text: str) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Redact the message and its string arguments of every record; never drops a record."""
+    """Redact each record after its arguments are merged into the message; never drops a record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = redact(record.msg)
-        if isinstance(record.args, tuple):
-            record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
-        elif isinstance(record.args, Mapping):
-            record.args = {k: redact(v) if isinstance(v, str) else v for k, v in record.args.items()}
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a malformed log call must not raise into the application
+            message = f"{record.msg} {record.args!r}"
+        record.msg = redact(message)
+        record.args = None
         return True
+
+
+class RedactingFormatter(logging.Formatter):
+    """Redact the whole formatted record, so exception and traceback text is covered too."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
 
 _FILTER = RedactingFilter()
@@ -56,12 +63,16 @@ def _level_number(level: str) -> int:
 
 
 def configure_logging(process_name: str, root: Path, level: str = "INFO") -> logging.Logger:
-    """Log to root/logs/<process_name>.log; INFO and above are redacted, DEBUG keeps full detail."""
+    """Send the package logger to root/logs/<process_name>.log; INFO and above are redacted, DEBUG is not.
+
+    The handler is attached to the "emailsupersearch" logger, so every module logging through
+    logging.getLogger(__name__) under that package reaches it. process_name only names the file.
+    """
     level_number = _level_number(level)
     log_dir = root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = os.path.abspath(log_dir / f"{process_name}.log")
-    logger = logging.getLogger(process_name)
+    logger = logging.getLogger(LOGGER_NAME)
 
     handler = _HANDLERS.get(process_name)
     if handler is not None and handler.baseFilename != log_path:
@@ -72,21 +83,22 @@ def configure_logging(process_name: str, root: Path, level: str = "INFO") -> log
         handler = RotatingFileHandler(
             log_path, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8"
         )
-        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         logger.addHandler(handler)
         _HANDLERS[process_name] = handler
 
     logger.setLevel(level_number)
     handler.setLevel(level_number)
     if level_number > logging.DEBUG:
+        handler.setFormatter(RedactingFormatter(_LOG_FORMAT))
         handler.addFilter(_FILTER)
     else:
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         handler.removeFilter(_FILTER)
     return logger
 
 
 def log_subject(subject: str) -> str:
     """Return the subject at DEBUG, else a short hash of it."""
-    if logging.getLogger("emailsupersearch").getEffectiveLevel() <= logging.DEBUG:
+    if logging.getLogger(LOGGER_NAME).getEffectiveLevel() <= logging.DEBUG:
         return subject
     return _token("subj", subject)
