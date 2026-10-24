@@ -25,7 +25,12 @@ from starlette.responses import (
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from emailsupersearch.host import routes_projects
+from emailsupersearch.host import (
+    routes_export,
+    routes_messages,
+    routes_projects,
+    routes_search,
+)
 from emailsupersearch.host.routes_projects import ApiError, json_error, services_of
 from emailsupersearch.host.security import (
     CSRF_COOKIE,
@@ -109,6 +114,9 @@ def create_app(services: Services) -> Starlette:
         Route("/health", health, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
         *routes_projects.routes(),
+        *routes_search.routes(),
+        *routes_messages.routes(),
+        *routes_export.routes(),
     ]
     if services.static_dir is not None and services.static_dir.is_dir():
         routes.append(Mount("/", app=StaticFiles(directory=services.static_dir, html=True)))

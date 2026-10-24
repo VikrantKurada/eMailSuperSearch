@@ -95,6 +95,10 @@ _RELATED_BY_ATTACHMENT = (
     " AND NOT (a.kind = 'image' AND a.size < ?)"
     f" AND m.chain_id IS NOT NULL AND m.chain_id != ? AND {LIVE_MESSAGE_SQL} ORDER BY m.chain_id LIMIT 3"
 )
+_CHAIN_MEMBERS_SQL = (
+    f"SELECT m.message_key FROM messages m WHERE m.chain_id = ? AND {LIVE_MESSAGE_SQL}"
+    " ORDER BY m.sent_ts IS NULL, m.sent_ts, m.message_key"
+)
 _SUBJECTS_SQL = (
     "SELECT c.chain_id, c.subject FROM chains c WHERE c.chain_id IN (SELECT value FROM json_each(?))"
     f" AND EXISTS (SELECT 1 FROM messages m WHERE m.chain_id = c.chain_id AND {LIVE_MESSAGE_SQL})"
@@ -200,6 +204,25 @@ def build_message_cards(
     return cards
 
 
+def _oldest_first(cards: list[MessageCard]) -> list[MessageCard]:
+    """``cards`` by ``sent_ts`` ascending, undated last, then by key."""
+    return sorted(cards, key=lambda c: (c.sent_ts is None, c.sent_ts or 0, c.message_key))
+
+
+def cards_for_keys(conn: sqlite3.Connection, keys: list[str]) -> list[MessageCard]:
+    """Unscored cards (score 0.0, no snippet) for the live messages among ``keys``, oldest first, undated last.
+
+    A repeated key gives one card; a key without a live file or a message row gives none.
+    """
+    unique = list(dict.fromkeys(keys))
+    return _oldest_first(build_message_cards(conn, [(key, 0.0, None) for key in unique], {}))
+
+
+def chain_member_keys(conn: sqlite3.Connection, chain_id: str) -> list[str]:
+    """The keys of the chain's live messages, by ``sent_ts`` (undated last), then by key."""
+    return [row[0] for row in conn.execute(_CHAIN_MEMBERS_SQL, (chain_id,)).fetchall()]
+
+
 def _participants(raw: str | None) -> dict[str, list[Person]]:
     """A ``chains.participants_json`` value as ``Person`` lists under ``from``, ``to`` and ``cc``.
 
@@ -229,7 +252,7 @@ def _distinct(people: list[Person]) -> list[Person]:
 
 def _chain_card(chain_id: str, members: list[MessageCard], row: Sequence | None) -> ChainCard:
     """The card of one chain from its ``chains`` row, or from its matched messages when it has no row."""
-    members = sorted(members, key=lambda c: (c.sent_ts is None, c.sent_ts or 0, c.message_key))
+    members = _oldest_first(members)
     shown: dict[tuple[str, int | None], AttachmentInfo] = {}
     for att in (a for card in members for a in card.attachments):
         shown.setdefault((att.filename, att.size), att)

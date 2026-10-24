@@ -362,3 +362,16 @@ def project(client, corpus_dir):
     r = client.post("/api/projects", json={"name": "Corpus", "folders": [str(corpus_dir)], "language": "en"})
     assert r.status_code == 201
     return r.json()["id"]
+
+
+@pytest.fixture
+def indexed_project(client, host_services, corpus_dir):
+    """The id of a project over ``corpus_dir`` created through the API, once its supervisor has indexed it."""
+    from helpers import wait_until
+
+    r = client.post("/api/projects", json={"name": "Indexed", "folders": [str(corpus_dir)], "language": "en"})
+    assert r.status_code == 201
+    project_id = r.json()["id"]
+    sup = host_services.supervisors[project_id]
+    wait_until(lambda: sup.status().state == "idle" and sup.store.counts()["messages"] > 0, 60)
+    return project_id

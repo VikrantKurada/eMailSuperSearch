@@ -23,6 +23,7 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "watchfiles>=1.0",
     "starlette>=1.9",
+    "anyio>=4.11",
     "uvicorn>=0.34",
     "sse-starlette>=2",
     "python-multipart>=0.0.20",
