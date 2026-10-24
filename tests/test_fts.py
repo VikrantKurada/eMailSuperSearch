@@ -65,3 +65,16 @@ def test_large_candidate_list_uses_json_each_on_read_only_connection(tmp_store):
         allowed = rowids[50:]  # 950 candidates, still over the inline limit; the other 50 must stay out
         rows = search(conn, "renewal", 2000, allowed)
         assert {r for r, _ in rows} == set(allowed)
+
+
+def test_sentence_final_word_is_found(tmp_store):
+    rowids = tmp_store.replace_chunks("m-end", "body", [ChunkText(0, "Please read the summary.", 4)])
+    assert [r for r, _ in bm25_search(tmp_store.read_conn(), "summary", 10, None)] == rowids
+
+
+def test_dotted_identifier_still_matches_as_phrase(tmp_store):
+    rowids = tmp_store.replace_chunks("m-dots", "body", [ChunkText(0, "see v1.2.3 and example.com", 4)])
+    conn = tmp_store.read_conn()
+    assert [r for r, _ in keyword_search(conn, "v1.2.3", 10, None)] == rowids
+    assert [r for r, _ in keyword_search(conn, "example.com", 10, None)] == rowids
+    assert keyword_search(conn, "com.example", 10, None) == []  # the phrase "com example" is in the wrong order

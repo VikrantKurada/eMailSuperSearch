@@ -1,10 +1,12 @@
 """Keyword search over the two FTS5 tables: ``chunks_fts`` (BM25 words) and ``chunks_trigram`` (partial identifiers).
 
-``chunks_fts`` keeps ``-_#@.`` inside tokens, so ``INV-2024-00017`` is one term; ``chunks_trigram`` matches any
-substring of three or more characters, which finds ``2024-000``. Every function takes a connection and runs a
-plain SELECT, so callers pass ``ProjectStore.read_conn()``. That connection is ``query_only``, which refuses
-writes to TEMP tables too, so a candidate list longer than ``INLINE_CANDIDATE_LIMIT`` is bound as one JSON array
-parameter and filtered with ``json_each`` (see ``candidates.py``).
+``chunks_fts`` keeps ``-_#@`` inside tokens, so ``INV-2024-00017`` is one term; a full stop separates tokens, so a
+sentence-final ``summary.`` is the word ``summary`` and ``example.com`` is the phrase ``example com`` (a quoted
+query is tokenised the same way as the text). ``chunks_trigram`` matches any substring of three or more characters,
+which finds ``2024-000``. Every function takes a connection and runs a plain SELECT, so callers pass
+``ProjectStore.read_conn()``. That connection is ``query_only``, which refuses writes to TEMP tables too, so a
+candidate list longer than ``INLINE_CANDIDATE_LIMIT`` is bound as one JSON array parameter and filtered with
+``json_each`` (see ``candidates.py``).
 
 Scores are ``-bm25()``, so higher is better. Task 23 fuses these rankings with the vector ranking by rank, so only
 the order matters, not the scale.

@@ -10,7 +10,7 @@ CREATE TABLE messages (message_key TEXT PRIMARY KEY, message_id TEXT, sent_ts IN
 CREATE TABLE recipients (message_key TEXT, kind TEXT, name TEXT, addr TEXT);
 CREATE TABLE attachments (message_key TEXT, ordinal INTEGER, filename TEXT, mime TEXT, size INTEGER, kind TEXT, sha256 TEXT, extract_status TEXT, ocr_status TEXT, embedded_partial INTEGER DEFAULT 0, page_count INTEGER, text_chars INTEGER, PRIMARY KEY (message_key, ordinal));
 CREATE TABLE chunks (id INTEGER PRIMARY KEY, message_key TEXT, part TEXT, idx INTEGER, text TEXT, token_count INTEGER, embedded INTEGER DEFAULT 0);
-CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='chunks', content_rowid='id', tokenize = "unicode61 tokenchars '-_#@.'");
+CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='chunks', content_rowid='id', tokenize = "unicode61 tokenchars '-_#@'");
 CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text); END;
 CREATE TRIGGER chunks_fts_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
 CREATE TRIGGER chunks_fts_au AFTER UPDATE OF text ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text); INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text); END;
