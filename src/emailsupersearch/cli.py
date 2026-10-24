@@ -4,9 +4,12 @@ Commands register themselves with `register`; with no command, `serve` runs when
 """
 
 import argparse
+import dataclasses
 import inspect
+import json
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from emailsupersearch import __version__
 from emailsupersearch.diagnostics.doctor import render_report, report_json, run_doctor
@@ -64,3 +67,29 @@ def _configure_doctor(parser: argparse.ArgumentParser) -> None:
 
 
 register("doctor", _doctor, _configure_doctor)
+
+
+def _bench(args: argparse.Namespace) -> int:
+    """Time parsing, embedding and nearest-neighbour search on a synthetic or given mail folder."""
+    # Imported here, not at the top: bench loads numpy and onnxruntime, and `doctor` must still run
+    # on a machine where one of those native modules is blocked.
+    from emailsupersearch.diagnostics.bench import run_bench
+
+    report = dataclasses.asdict(run_bench(args.corpus, vectors=args.vectors))
+    if args.json:
+        _print(json.dumps(report, indent=2))
+        return 0
+    for name, value in report.items():
+        if name == "notes":
+            value = " | ".join(value) or "none"
+        _print(f"{name}: {'n/a' if value is None else value}")
+    return 0
+
+
+def _configure_bench(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--corpus", type=Path, help="folder of .eml/.msg files to time instead of the synthetic corpus")
+    parser.add_argument("--vectors", type=int, default=300_000, help="rows in the nearest-neighbour test (default 300000)")
+    parser.add_argument("--json", action="store_true", help="print the report as JSON")
+
+
+register("bench", _bench, _configure_bench)
