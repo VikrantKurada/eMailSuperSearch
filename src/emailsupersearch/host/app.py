@@ -30,6 +30,8 @@ from emailsupersearch.host import (
     routes_messages,
     routes_projects,
     routes_search,
+    routes_settings,
+    routes_sync,
 )
 from emailsupersearch.host.routes_projects import ApiError, json_error, services_of
 from emailsupersearch.host.security import (
@@ -117,6 +119,8 @@ def create_app(services: Services) -> Starlette:
         *routes_search.routes(),
         *routes_messages.routes(),
         *routes_export.routes(),
+        *routes_sync.routes(),
+        *routes_settings.routes(),
     ]
     if services.static_dir is not None and services.static_dir.is_dir():
         routes.append(Mount("/", app=StaticFiles(directory=services.static_dir, html=True)))

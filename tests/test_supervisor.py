@@ -311,3 +311,10 @@ def test_request_rescan_coalesces(sup):
     sup.stop()
     finished = [e for e in sup.events_for_tests if e["type"] == "scan_finished"]
     assert 1 <= len(finished) <= 2 and max(e["scan_id"] for e in finished) <= 2
+
+
+def test_set_reconcile_interval_changes_next_timer(sup):
+    sup.set_reconcile_interval(120)
+    assert sup.reconcile_interval_s == 120  # what _arm_timer reads
+    sup._arm_timer()
+    assert sup._timer.interval == 120  # stop() at teardown cancels it

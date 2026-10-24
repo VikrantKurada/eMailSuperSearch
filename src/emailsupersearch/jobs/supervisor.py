@@ -243,6 +243,12 @@ class ProjectSupervisor:
             self._rescan_queued = True
         self._commands.put(("rescan", subtree))
 
+    def set_reconcile_interval(self, seconds: int) -> None:
+        """Wait ``seconds`` between timer scans from the next time the timer is armed (after the next scan); the
+        project settings route calls this when the setting changes."""
+        with self._lifecycle:
+            self.reconcile_interval_s = seconds
+
     def status(self) -> SyncStatus:
         """The current status; once the store is closed, the last one known, ``idle`` with the error ``closed``."""
         try:
