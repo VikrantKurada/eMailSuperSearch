@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emailsupersearch"
+version = "0.0.1"
+description = "Offline, zero-admin e-mail search for Windows."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "GPL-3.0-or-later"
+dependencies = [
+    "extract-msg>=0.56,<0.57",
+    "pypdfium2>=5",
+    "python-docx>=1.2",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
+    "Pillow>=11",
+    "numpy>=2",
+    "onnxruntime>=1.31",
+    "tokenizers>=0.21",
+    "sqlite-vec>=0.1.6",
+    "watchfiles>=1.0",
+    "starlette>=1.0",
+    "uvicorn>=0.34",
+    "sse-starlette>=2",
+    "python-multipart>=0.0.20",
+    "winrt-runtime>=3; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr>=3; sys_platform == 'win32'",
+    "winrt-Windows.Globalization>=3; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=3; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=3; sys_platform == 'win32'",
+    "winrt-Windows.Foundation>=3; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections>=3; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+nlp = ["emailsupersearch-models-en>=0.1"]
+ocr = ["rapidocr>=3.10,<4", "opencv-python-headless>=4.10"]
+all = ["emailsupersearch[nlp,ocr]"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6", "pypdf>=5", "build>=1.2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emailsupersearch"]
+artifacts = ["src/emailsupersearch/ui/dist/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
