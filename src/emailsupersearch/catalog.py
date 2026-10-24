@@ -23,7 +23,7 @@ from emailsupersearch.ingest.watcher import is_network_path
 from emailsupersearch.paths import ensure_layout, project_dir
 from emailsupersearch.store import ProjectStore
 
-_RMTREE_ATTEMPTS = 5
+_RMTREE_RETRIES = 5  # after the first attempt: six tries in all, 0.2 s apart
 _RMTREE_RETRY_S = 0.2
 
 _SCHEMA = (
@@ -51,21 +51,30 @@ def _clean_name(name: str) -> str:
 
 
 def _remove_tree(path: Path) -> None:
-    """Remove ``path``, retrying on ``PermissionError``: Windows releases a closed database's file handles late."""
-    for attempt in range(_RMTREE_ATTEMPTS):
+    """Remove ``path``, retrying on ``PermissionError``: Windows releases a closed database's file handles late.
+
+    A missing ``path`` is fine. When the last retry still fails, the ``PermissionError`` propagates.
+    """
+    for attempt in range(_RMTREE_RETRIES + 1):
         try:
             shutil.rmtree(path)
             return
         except FileNotFoundError:
             return
         except PermissionError:
-            if attempt == _RMTREE_ATTEMPTS - 1:
+            if attempt == _RMTREE_RETRIES:
                 raise
             time.sleep(_RMTREE_RETRY_S)
 
 
 class Catalog:
-    """The global database of projects and settings. Thread-safe: one connection, every method under an ``RLock``."""
+    """The global database of projects and settings.
+
+    Thread-safe: one connection shared by all threads, and every statement on it runs under an ``RLock``.
+    ``open_store`` and ``delete_project`` also hold that lock across the project directory work, so the two cannot
+    interleave. ``create_project`` sets up the new project's own database outside the lock, because nothing else can
+    reach the project until its catalog row exists.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -96,36 +105,41 @@ class Catalog:
         """Create a project: its directory, its ``project.sqlite`` with the default settings and the watched folders.
 
         The store used to set it up is closed before this returns; open the project's own through ``open_store``.
+        When any step fails, the half-built project directory is removed and the error is re-raised.
         """
         name = _clean_name(name)
         project_id = uuid.uuid4().hex[:12]
         directory = project_dir(self.root, project_id)
         (directory / "exports").mkdir(parents=True)
-        store = ProjectStore.open(directory)
         try:
-            for folder in folders:
-                kind = "network" if is_network_path(Path(folder)) else "local"
-                store.add_folder(os.path.normpath(str(folder)), kind)
-            for key, value in (
-                ("language", language),
-                ("embedder_id", embedder_id),
-                ("embedding_dim", embedding_dim),
-                ("chunker_version", CHUNKER_VERSION),
-                ("reconcile_interval_s", 900),
-                ("ocr_enabled", True),
-                ("ocr_engine_order", ["windows", "rapid"]),
-                ("group_by_chain_default", True),
-                ("export_dir", None),
-                ("saved_searches", []),
-            ):
-                store.set_setting(key, value)
-        finally:
-            store.close()
-        created_at = int(time.time())
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO projects(id, name, created_at) VALUES (?, ?, ?)", (project_id, name, created_at)
-            )
+            store = ProjectStore.open(directory)
+            try:
+                for folder in folders:
+                    kind = "network" if is_network_path(Path(folder)) else "local"
+                    store.add_folder(os.path.normpath(str(folder)), kind)
+                for key, value in (
+                    ("language", language),
+                    ("embedder_id", embedder_id),
+                    ("embedding_dim", embedding_dim),
+                    ("chunker_version", CHUNKER_VERSION),
+                    ("reconcile_interval_s", 900),
+                    ("ocr_enabled", True),
+                    ("ocr_engine_order", ["windows", "rapid"]),
+                    ("group_by_chain_default", True),
+                    ("export_dir", None),
+                    ("saved_searches", []),
+                ):
+                    store.set_setting(key, value)
+            finally:
+                store.close()
+            created_at = int(time.time())
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT INTO projects(id, name, created_at) VALUES (?, ?, ?)", (project_id, name, created_at)
+                )
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)  # the setup store is closed by now, so Windows lets go
+            raise
         return Project(project_id, name, created_at, directory)
 
     def list_projects(self) -> list[Project]:
@@ -149,27 +163,31 @@ class Catalog:
                 raise KeyError(project_id)
 
     def delete_project(self, project_id: str) -> bool:
-        """Delete the project's catalog row and its directory; True when a row existed.
+        """Delete the project's directory and then its catalog row; True when a row existed.
 
         Every ``ProjectStore`` opened on the project must be closed first, or Windows refuses to delete the
-        database files (the removal retries briefly because it releases handles late, then raises
-        ``PermissionError``). A missing directory is not an error.
+        database files. The removal retries five times, 0.2 s apart, because Windows releases handles late; if it
+        still fails, the ``PermissionError`` propagates and the row stays, so the project remains listed and the
+        delete can be retried. A missing directory is not an error. The catalog lock is held throughout.
         """
-        with self._lock, self._conn:
-            existed = self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,)).rowcount > 0
-        if existed:
+        with self._lock:
+            if self.get(project_id) is None:
+                return False
             _remove_tree(project_dir(self.root, project_id))
-        return existed
+            with self._conn:
+                self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            return True
 
     def open_store(self, project_id: str) -> ProjectStore:
         """Open the project's ``ProjectStore``; ``KeyError`` for an unknown id, ``SchemaTooNew`` for a newer database.
 
         Every call opens a new store and the caller owns it: close it when done (the host keeps one per supervisor).
         """
-        project = self.get(project_id)
-        if project is None:
-            raise KeyError(project_id)
-        return ProjectStore.open(project.dir)
+        with self._lock:  # a concurrent delete_project must not remove the directory and then see it recreated
+            project = self.get(project_id)
+            if project is None:
+                raise KeyError(project_id)
+            return ProjectStore.open(project.dir)
 
     def _project(self, row: sqlite3.Row) -> Project:
         return Project(row["id"], row["name"], row["created_at"], project_dir(self.root, row["id"]))

@@ -3,7 +3,9 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
+import uuid
 
 import pytest
 
@@ -19,6 +21,22 @@ def catalog(tmp_path):
     c = Catalog(tmp_path)
     yield c
     c.close()
+
+
+def _lock_is_free_for_other_threads(catalog) -> bool:
+    """Whether a second thread could take the catalog lock right now (False while this thread holds it)."""
+    outcome: list[bool] = []
+
+    def probe() -> None:
+        got = catalog._lock.acquire(blocking=False)
+        if got:
+            catalog._lock.release()
+        outcome.append(got)
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join()
+    return outcome[0]
 
 
 def test_create_list_get_delete_project(catalog, tmp_path, corpus_dir):
@@ -175,6 +193,21 @@ def test_open_store_unknown_id_raises(catalog):
         catalog.open_store("nosuchproject")
 
 
+def test_open_store_holds_the_catalog_lock_while_opening(catalog, corpus_dir, monkeypatch):
+    project = catalog.create_project("Locked", [corpus_dir])
+    real_open = catalog_module.ProjectStore.open
+    lock_free: list[bool] = []
+
+    def spy(directory):
+        lock_free.append(_lock_is_free_for_other_threads(catalog))
+        return real_open(directory)
+
+    monkeypatch.setattr(catalog_module.ProjectStore, "open", spy)
+    catalog.open_store(project.id).close()
+
+    assert lock_free == [False]
+
+
 def test_network_folder_kind(catalog, corpus_dir, monkeypatch):
     monkeypatch.setattr(catalog_module, "is_network_path", lambda p: True)
     project = catalog.create_project("Share", [corpus_dir])
@@ -205,6 +238,52 @@ def test_delete_project_with_closed_store_removes_directory_on_windows(catalog, 
     assert catalog.delete_project(project.id) is True
     assert not project.dir.exists()
     assert catalog.get(project.id) is None
+    with pytest.raises(KeyError):
+        catalog.open_store(project.id)
+    assert not project.dir.exists()  # a late open_store cannot bring the directory back
+
+
+def test_delete_project_failure_keeps_the_row_and_can_be_retried(catalog, corpus_dir, monkeypatch):
+    project = catalog.create_project("Stubborn", [corpus_dir])
+    calls: list[bool] = []
+
+    def refuse(path, *args, **kwargs):
+        calls.append(_lock_is_free_for_other_threads(catalog))
+        raise PermissionError("in use")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_module.shutil, "rmtree", refuse)
+        patch.setattr(catalog_module, "_RMTREE_RETRY_S", 0)
+        with pytest.raises(PermissionError):
+            catalog.delete_project(project.id)
+
+    assert len(calls) == catalog_module._RMTREE_RETRIES + 1 == 6
+    assert calls == [False] * 6  # the catalog lock is held while the directory is removed
+    assert catalog.get(project.id) == project  # still listed, so the owner can retry
+    assert project.dir.is_dir()
+
+    assert catalog.delete_project(project.id) is True  # the second call, with rmtree working again
+    assert not project.dir.exists()
+    assert catalog.get(project.id) is None
+
+
+def test_delete_project_retries_until_windows_lets_go(catalog, corpus_dir, monkeypatch):
+    project = catalog.create_project("Slow release", [corpus_dir])
+    real_rmtree = shutil.rmtree
+    attempts: list[int] = []
+
+    def release_late(path, *args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise PermissionError("in use")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.shutil, "rmtree", release_late)
+    monkeypatch.setattr(catalog_module, "_RMTREE_RETRY_S", 0)
+
+    assert catalog.delete_project(project.id) is True
+    assert len(attempts) == 3
+    assert not project.dir.exists()
 
 
 def test_delete_project_tolerates_a_missing_directory(catalog, corpus_dir):
@@ -216,7 +295,7 @@ def test_delete_project_tolerates_a_missing_directory(catalog, corpus_dir):
     assert catalog.get(project.id) is None
 
 
-def test_create_project_failure_closes_its_store_and_registers_nothing(catalog, tmp_path, corpus_dir, monkeypatch):
+def test_create_project_failure_closes_its_store_and_removes_the_directory(catalog, tmp_path, corpus_dir, monkeypatch):
     def boom(p):
         raise RuntimeError("boom")
 
@@ -225,5 +304,19 @@ def test_create_project_failure_closes_its_store_and_registers_nothing(catalog, 
         catalog.create_project("Broken", [corpus_dir])
 
     assert catalog.list_projects() == []
-    (leftover,) = (tmp_path / "projects").iterdir()
-    (leftover / "project.sqlite").unlink()  # the setup store was closed, so Windows lets go of the file
+    # The setup store was closed first, otherwise Windows would have refused to delete project.sqlite.
+    assert list((tmp_path / "projects").iterdir()) == []
+
+
+def test_create_project_failure_after_the_store_is_set_up_removes_the_directory(
+    catalog, tmp_path, corpus_dir, monkeypatch
+):
+    monkeypatch.setattr(catalog_module.uuid, "uuid4", lambda: uuid.UUID(int=1))
+    catalog.create_project("First", [corpus_dir])  # takes the only id uuid4 now yields
+    (taken,) = (tmp_path / "projects").iterdir()
+
+    with pytest.raises(FileExistsError):  # the same id again: the directory already exists
+        catalog.create_project("Second", [corpus_dir])
+
+    assert [p.name for p in catalog.list_projects()] == ["First"]
+    assert taken.is_dir() and (taken / "project.sqlite").is_file()  # the first project is untouched
