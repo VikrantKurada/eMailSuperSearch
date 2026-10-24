@@ -2,16 +2,18 @@
 
 The launcher opens the browser at ``/auth?token=<launch token>``; the host answers with an ``HttpOnly`` session cookie
 and a readable CSRF cookie. Every ``/api/*`` request needs the session cookie, and every one that is not a GET or
-HEAD also needs the CSRF value echoed in the ``X-ESS-Token`` header. The Host header must name a loopback address
-(this defeats DNS rebinding) and an ``Origin``, when present, must be a loopback one. ``/api/shutdown`` also accepts
-the launch token in ``X-ESS-Launch``, for the ``stop`` command, which has no browser session.
+HEAD also needs the CSRF value echoed in the ``X-ESS-Token`` header. The Host header must be a loopback name with an
+optional port (this defeats DNS rebinding), and an ``Origin``, when present, must be ``http://`` plus exactly that
+Host value (same host, same port). ``/api/shutdown`` also accepts the launch token in ``X-ESS-Launch``, for the
+``stop`` command, which has no browser session.
 
-Nothing here logs a token or a cookie value.
+Nothing here logs a token, a cookie value or a request body.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 import threading
 from urllib.parse import urlsplit
@@ -36,6 +38,10 @@ _SECURITY_HEADERS = {
 }
 _EXEMPT_PATHS = {"/auth", "/health"}
 _SAFE_METHODS = {"GET", "HEAD"}
+# A whole Host header: one of LOOPBACK_HOSTS, then an optional port. Anything else is refused.
+_HOST_RE = re.compile(
+    "(?:" + "|".join(re.escape(h) for h in sorted(LOOPBACK_HOSTS)) + r")(?::\d{1,5})?", re.IGNORECASE
+)
 
 
 def new_token() -> str:
@@ -50,13 +56,24 @@ def same_secret(given: str | None, expected: str) -> bool:
     return secrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
-def _host_without_port(value: str) -> str:
-    """The host part of a ``Host`` header or URL authority, lower-cased; ``[::1]`` keeps its brackets."""
-    value = value.strip().lower()
-    if value.startswith("["):
-        end = value.find("]")
-        return value if end == -1 else value[: end + 1]
-    return value.rsplit(":", 1)[0] if ":" in value else value
+def _host_ok(host: str) -> bool:
+    """Whether a Host header value is a loopback name with an optional port, and nothing more."""
+    return _HOST_RE.fullmatch(host) is not None
+
+
+def _origin_ok(origin: str, host: str) -> bool:
+    """Whether ``origin`` is ``http://<host>`` for this request's Host value: same host and port, no path."""
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and parts.netloc.lower() == host.lower()
+        and not parts.path
+        and not parts.query
+        and not parts.fragment
+    )
 
 
 class SessionStore:
@@ -83,7 +100,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     """Refuses what does not pass the checks in the module docstring and adds the security headers to every response.
 
     Order: Host (400), Origin (403), then for ``/api/*`` only: the launch header on ``/api/shutdown``, the session
-    cookie (401) and, for methods other than GET and HEAD, the CSRF header (401).
+    cookie (401) and, for methods other than GET and HEAD, the CSRF header (401). Paths are the ASGI ``scope["path"]``
+    the router matches on. An exception escaping an endpoint becomes a JSON 500, so it carries the headers too.
     """
 
     def __init__(self, app: ASGIApp, launch_token: str, sessions: SessionStore) -> None:
@@ -92,19 +110,28 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         self.sessions = sessions
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        refusal = self._refusal(request)
-        response = refusal if refusal is not None else await call_next(request)
+        response = self._refusal(request)
+        if response is None:
+            try:
+                response = await call_next(request)
+            except Exception as e:
+                endpoint = request.scope.get("endpoint")
+                route = getattr(endpoint, "__name__", "(no route)")
+                log.warning("%s %s failed: %s", request.method, route, type(e).__name__)
+                log.debug("%s %s failed", request.method, route, exc_info=True)
+                response = JSONResponse({"error": "internal error"}, status_code=500)
         response.headers.update(_SECURITY_HEADERS)
         return response
 
     def _refusal(self, request: Request) -> Response | None:
         """The error response for a request that fails a check, or None when it may proceed."""
-        if _host_without_port(request.headers.get("host", "")) not in LOOPBACK_HOSTS:
+        host = request.headers.get("host", "")
+        if not _host_ok(host):
             return _refuse(400, "bad host", request)
         origin = request.headers.get("origin")
-        if origin is not None and _host_without_port(urlsplit(origin).netloc) not in LOOPBACK_HOSTS:
+        if origin is not None and not _origin_ok(origin, host):
             return _refuse(403, "foreign origin", request)
-        path = request.url.path
+        path = request.scope["path"]
         if path in _EXEMPT_PATHS or not path.startswith("/api/"):
             return None
         if path == "/api/shutdown" and same_secret(request.headers.get(LAUNCH_HEADER), self.launch_token):

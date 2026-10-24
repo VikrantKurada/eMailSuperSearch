@@ -1,9 +1,14 @@
 """The project and status routes, driven through the real app with real supervisors."""
 
+import asyncio
 import os
 from pathlib import Path
 
+import pytest
+from starlette.requests import Request
+
 from emailsupersearch import __version__
+from emailsupersearch.host.routes_projects import read_json, read_json_async
 
 
 def test_project_crud_and_status(client, corpus_dir, host_services):
@@ -71,3 +76,43 @@ def test_create_project_rejects_missing_folder(client, tmp_path):
     r = client.post("/api/projects", json={"name": "x", "folders": [str(tmp_path / "missing")], "language": "en"})
     assert r.status_code == 400 and "folders[0]" in r.json()["error"]
     assert client.get("/api/projects").json() == []
+
+
+def test_create_with_failing_supervisor_reports_blocked(client, host_services, corpus_dir, monkeypatch):
+    def fail(project_id):
+        raise RuntimeError("cannot start")
+
+    monkeypatch.setattr(host_services, "start_supervisor", fail)
+    r = client.post("/api/projects", json={"name": "Mail", "folders": [str(corpus_dir)]})
+    assert r.status_code == 201
+    pid = r.json()["id"]
+    assert pid not in host_services.supervisors
+    entry = next(p for p in client.get("/api/status").json()["projects"] if p["id"] == pid)
+    assert entry["blocked"] == "RuntimeError" and entry["sync"] is None
+
+
+def test_delete_failure_reports_blocked_until_retry(client, host_services, project, monkeypatch):
+    def locked(project_id):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(host_services.catalog, "delete_project", locked)
+    r = client.delete(f"/api/projects/{project}")
+    assert r.status_code == 409 and r.json() == {"error": "project files are still in use; retry"}
+    assert project not in host_services.supervisors
+    entry = next(p for p in client.get("/api/status").json()["projects"] if p["id"] == project)
+    assert entry["blocked"] == "delete failed; retry" and entry["sync"] is None
+
+    monkeypatch.undo()
+    assert client.delete(f"/api/projects/{project}").status_code == 204
+    assert project not in host_services.blocked_projects
+    assert client.get("/api/projects").json() == []
+
+
+def test_read_json_needs_a_sync_endpoint_and_has_an_async_twin():
+    async def receive():
+        return {"type": "http.request", "body": b'{"a": 1}', "more_body": False}
+
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": []}
+    with pytest.raises(RuntimeError, match="sync endpoint"):
+        read_json(Request(scope, receive))
+    assert asyncio.run(read_json_async(Request(scope, receive))) == {"a": 1}

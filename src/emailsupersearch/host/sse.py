@@ -8,8 +8,11 @@ Keepalive pings are left to sse-starlette.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
+
+QUEUE_MAX = 1000  # events held per subscriber; on overflow the oldest is dropped
 
 
 class EventBus:
@@ -49,11 +52,20 @@ class EventBus:
         with self._lock:
             return self._last.get(topic)
 
-    async def subscribe(self, topic: str) -> AsyncIterator[dict]:
-        """Yield every event published on ``topic`` from now until the consumer stops iterating."""
-        queue: asyncio.Queue[dict] = asyncio.Queue()
+    def subscribe(self, topic: str) -> AsyncGenerator[dict, None]:
+        """Start receiving ``topic`` now and return an async iterator over its events, from the loop.
+
+        The subscriber's queue is registered by this call, so nothing published before the first ``__anext__`` is
+        lost. It is unregistered when the iterator finishes: on ``aclose()``, on cancellation (a client that
+        disconnects) or when the loop finalises it. Iterate what this returns; an iterator dropped before its first
+        ``__anext__`` never runs its cleanup and stays registered, holding at most ``QUEUE_MAX`` events.
+        """
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX)
         with self._lock:
             self._subscribers.setdefault(topic, set()).add(queue)
+        return self._drain(topic, queue)
+
+    async def _drain(self, topic: str, queue: asyncio.Queue[dict]) -> AsyncGenerator[dict, None]:
         try:
             while True:
                 yield await queue.get()
@@ -69,6 +81,9 @@ class EventBus:
         with self._lock:
             queues = list(self._subscribers.get(topic, ()))
         for queue in queues:
+            if queue.full():  # a stalled subscriber: drop its oldest event rather than grow without bound
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
             queue.put_nowait(event)
 
 

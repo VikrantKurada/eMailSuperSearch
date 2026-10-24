@@ -8,6 +8,7 @@ fields of the wrong type, 404 for an unknown project, 409 for a project that has
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from dataclasses import asdict
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     from emailsupersearch.catalog import Project
     from emailsupersearch.host.app import Services
     from emailsupersearch.jobs.supervisor import ProjectSupervisor
+
+log = logging.getLogger(__name__)
 
 _REQUIRED = object()
 _ocr_lock = threading.Lock()
@@ -61,9 +64,22 @@ def services_of(request: Request) -> Services:
 def read_json(request: Request) -> Any:
     """The request's JSON body, from a plain ``def`` endpoint; ``ApiError(400)`` when it is not valid JSON.
 
-    The body is read on the event loop through anyio's portal, which exists in Starlette's threadpool threads.
+    The body is read on the event loop through anyio's portal, which exists in Starlette's threadpool threads only;
+    elsewhere this raises ``RuntimeError``. Async endpoints use ``read_json_async``.
     """
-    body = anyio.from_thread.run(request.body)
+    try:
+        body = anyio.from_thread.run(request.body)
+    except anyio.NoEventLoopError:
+        raise RuntimeError("read_json must be called from a sync endpoint") from None
+    return _parse_json(body)
+
+
+async def read_json_async(request: Request) -> Any:
+    """``read_json`` for an ``async def`` endpoint."""
+    return _parse_json(await request.body())
+
+
+def _parse_json(body: bytes) -> Any:
     try:
         return json.loads(body)
     except ValueError:  # JSONDecodeError and UnicodeDecodeError both are
@@ -174,9 +190,15 @@ def create_project(request: Request) -> JSONResponse:
         )
     except ValueError as e:  # a blank name
         raise ApiError(400, str(e)) from None
-    sup = services.start_supervisor(project.id)
-    services.supervisors[project.id] = sup
-    sup.start()
+    try:
+        sup = services.start_supervisor(project.id)
+    except Exception as e:  # the project exists; the status shows it blocked rather than the create failing
+        log.warning("the new project's supervisor could not be built: %s", type(e).__name__)
+        log.debug("building the supervisor failed", exc_info=True)
+        services.blocked_projects[project.id] = type(e).__name__
+    else:
+        services.supervisors[project.id] = sup
+        sup.start()
     return JSONResponse(project_dict(project), status_code=201)
 
 
@@ -210,7 +232,8 @@ def delete_project(request: Request) -> Response:
         sup.stop()  # closes the project's store, so Windows lets the directory go
     try:
         deleted = services.catalog.delete_project(project_id)
-    except PermissionError:
+    except PermissionError:  # its supervisor is gone now: report the project blocked until a retry succeeds
+        services.blocked_projects[project_id] = "delete failed; retry"
         return json_error(409, "project files are still in use; retry")
     if not deleted:
         raise ApiError(404, "no such project")
