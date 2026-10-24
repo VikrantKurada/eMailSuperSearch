@@ -1,11 +1,13 @@
+import random
 import re
+import string
+import time
 from itertools import pairwise
 
 import pytest
 from helpers import LONG_TEXT_3000_WORDS, LONG_TEXT_30000_WORDS
 from tokenizers import Tokenizer
 
-from emailsupersearch.index.embedder import tokenizer_path
 from emailsupersearch.ingest.chunker import Chunker, ChunkText, context_line_for
 
 
@@ -30,15 +32,27 @@ def test_chunk_text_is_context_line_newline_piece(chunker):
     assert out == [ChunkText(0, "ctx\nFirst point.\n\nSecond point.", out[0].token_count)]
 
 
-def test_token_count_is_that_of_the_full_chunk_text(chunker):
-    import emailsupersearch_models_en as models
+_MIXED_BLOB = "".join(random.Random(5).choices(string.ascii_letters + string.digits + "+/=-.", k=4000))
+_TEXTS = {
+    "prose": LONG_TEXT_3000_WORDS,
+    "unpunctuated": " ".join(LONG_TEXT_3000_WORDS.replace(".", "").split()),
+    "blob": "Intro sentence. " + _MIXED_BLOB + " Closing sentence.",
+    "rule": "Intro sentence. " + "=" * 3000,
+    "cjk": "漢字" * 800,
+}
 
-    tok = Tokenizer.from_file(str(tokenizer_path(models.embedding_dir())))
+
+@pytest.mark.parametrize("name", list(_TEXTS))
+@pytest.mark.parametrize("budget", [(220, 256), (12, 40)], ids=["default", "tiny"])
+def test_token_count_is_that_of_the_full_chunk_text(tokenizer_file, name, budget):
+    tok = Tokenizer.from_file(str(tokenizer_file))
     tok.no_truncation()  # the shipped file truncates and pads to 128
     tok.no_padding()
-    out = chunker.chunk(LONG_TEXT_3000_WORDS, "From a on 2026-03-01: s [body]")
+    chunker = Chunker(tokenizer_file, target_tokens=budget[0], hard_max_tokens=budget[1])
+    out = chunker.chunk(_TEXTS[name], "From a on 2026-03-01: s [body]")
     assert [c.idx for c in out] == list(range(len(out)))
     assert all(c.token_count == len(tok.encode(c.text, add_special_tokens=False).ids) for c in out)
+    assert all(c.token_count <= budget[1] for c in out)
 
 
 def test_overlong_context_line_never_pushes_a_chunk_past_hard_max(chunker, chunker_ws):
@@ -47,7 +61,11 @@ def test_overlong_context_line_never_pushes_a_chunk_past_hard_max(chunker, chunk
         assert len(out) > 5 and all(x.token_count <= 256 for x in out)
 
 
-@pytest.mark.parametrize("text", ["word " * 700, "=" * 3000, "Lead in. " + "9 " * 700 + "tail."])
+@pytest.mark.parametrize(
+    "text",
+    ["word " * 700, "=" * 3000, "Lead in. " + "9 " * 700 + "tail."],
+    ids=["words", "rule", "digits-between-sentences"],
+)
 def test_oversized_sentences_are_split_to_fit(chunker, text):
     out = chunker.chunk(text, "ctx")
     assert len(out) > 1 and all(c.token_count <= 256 for c in out)
@@ -81,3 +99,45 @@ def test_overlap_is_the_last_sentences_that_fit_under_the_ratio(chunker_ws):
     text = " ".join(f"S{i} " + "x " * 8 + "x." for i in range(100))
     first, second = (list(map(int, re.findall(r"S(\d+)", c.text))) for c in chunker_ws.chunk(text, "ctx")[:2])
     assert second[:3] == first[-3:] and second[3] == first[-1] + 1
+
+
+@pytest.mark.parametrize(
+    ("ts", "date"),
+    [(0, "1970-01-01"), (-2208988800, "1900-01-01"), (253402297200, "9999-12-31"), (253402300800, "unknown date"), (10**18, "unknown date")],
+)
+def test_context_line_dates_beyond_the_platform_range(ts, date):
+    assert context_line_for("a", ts, "s", "body") == f"From a on {date}: s [body]"
+
+
+_UNPUNCTUATED = " ".join(LONG_TEXT_3000_WORDS.replace(".", "").split())
+
+
+def _overlap_words(a: ChunkText, b: ChunkText) -> list[str]:
+    """The longest run of words that ends one chunk's piece and starts the next one's."""
+    wa, wb = a.text.split("\n", 1)[1].split(), b.text.split("\n", 1)[1].split()
+    return next(wa[-k:] for k in range(min(len(wa), len(wb)), 0, -1) if wa[-k:] == wb[:k])
+
+
+@pytest.mark.parametrize("n_words", [221, 2000, 3000])
+@pytest.mark.parametrize("fixture", ["chunker", "chunker_ws"])
+def test_text_without_sentence_breaks_overlaps_and_leaves_no_orphans(request, fixture, n_words):
+    c = request.getfixturevalue(fixture)
+    out = c.chunk(" ".join(_UNPUNCTUATED.split()[:n_words]), "ctx")
+    assert len(out) > 1
+    assert all(x.token_count - 1 >= 110 for x in out[:-1])  # the 1 is the "ctx" line; 110 is half of 220
+    for a, b in pairwise(out):
+        shared = c.chunk(" ".join(_overlap_words(a, b)), "")[0].token_count
+        assert int(0.15 * 220) - 5 <= shared <= int(0.15 * 220)
+
+
+@pytest.mark.parametrize("kind", ["base64", "rule"])
+def test_huge_unbroken_token_is_split_in_near_linear_time(chunker, kind):
+    blob = (
+        "".join(random.Random(3).choices(string.ascii_letters + string.digits + "+/", k=1_000_000))
+        if kind == "base64"
+        else "=" * 200_000
+    )
+    start = time.perf_counter()
+    out = chunker.chunk(blob, "ctx")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 3 and len(out) > 100 and all(c.token_count <= 256 for c in out)

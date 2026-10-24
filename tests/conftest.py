@@ -26,12 +26,19 @@ def embedder():
 
 
 @pytest.fixture(scope="session")
-def chunker():
-    """A chunker that counts the real MiniLM word pieces; skipped when the model files have not been fetched."""
+def tokenizer_file() -> Path:
+    """The MiniLM ``tokenizer.json``; skipped when the model files have not been fetched."""
     from emailsupersearch.index.embedder import tokenizer_path
+
+    return tokenizer_path(_model_dir_or_skip())
+
+
+@pytest.fixture(scope="session")
+def chunker(tokenizer_file):
+    """A chunker that counts the real MiniLM word pieces; skipped when the model files have not been fetched."""
     from emailsupersearch.ingest.chunker import Chunker
 
-    return Chunker(tokenizer_path(_model_dir_or_skip()))
+    return Chunker(tokenizer_file)
 
 
 @pytest.fixture(scope="session")
