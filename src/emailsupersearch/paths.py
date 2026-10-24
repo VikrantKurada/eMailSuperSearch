@@ -24,7 +24,7 @@ def validate_data_root(p: Path) -> str | None:
     """Return the reason a data root is refused, or None when it is acceptable."""
     normalised = PureWindowsPath(ntpath.normpath(str(p)))
     parts = normalised.parts
-    if any(part.lower() == "onedrive" for part in parts):
+    if any(part.lower().startswith("onedrive") for part in parts):
         return "the data root must not be inside OneDrive: a synced folder corrupts a live SQLite database"
     if (
         _DRIVE_RE.fullmatch(normalised.drive)
