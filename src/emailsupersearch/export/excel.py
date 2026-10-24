@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +35,9 @@ _HEADERS = (
 _PREVIEW_COLUMN = _HEADERS.index("Preview") + 1
 _OPEN_COLUMN = _HEADERS.index("Open") + 1
 _MAX_WIDTH = 60
+_MAX_CELL_CHARS = 32_767  # Excel refuses to open a workbook whose cell text is longer
+_REPLACEMENT_CHAR = chr(0xFFFD)
+_LONE_SURROGATE_RE = re.compile(f"[{chr(0xD800)}-{chr(0xDFFF)}]")
 
 
 @dataclass
@@ -46,9 +52,12 @@ class ExportInfo:
 def _write_text(cell: Cell, value: str) -> None:
     """Store ``value`` as a string even when it starts with ``=``, so Excel never evaluates it.
 
-    Control characters that a worksheet cannot hold (openpyxl raises on them) are dropped.
+    Text that a worksheet cannot hold is repaired rather than failing the export: lone surrogates (what
+    undecodable bytes become in mail text) turn into U+FFFD, control characters openpyxl rejects are
+    dropped, and the text is cut at Excel's cell limit.
     """
-    cell.value = ILLEGAL_CHARACTERS_RE.sub("", value)
+    value = _LONE_SURROGATE_RE.sub(_REPLACEMENT_CHAR, value)
+    cell.value = ILLEGAL_CHARACTERS_RE.sub("", value)[:_MAX_CELL_CHARS]
     cell.data_type = "s"
 
 
@@ -64,10 +73,12 @@ def _row_values(card: MessageCard, chain_subjects: dict[str, str] | None) -> lis
     """The cells of one card from Date to Preview, in column order."""
     when = ""
     if card.sent_ts is not None:
-        when = datetime.fromtimestamp(card.sent_ts, UTC).strftime("%Y-%m-%d %H:%M")
-    chain = ""
-    if card.chain_id:
-        chain = (chain_subjects or {}).get(card.chain_id, card.chain_id)
+        # A timestamp the platform cannot turn into a date leaves the cell empty.
+        with contextlib.suppress(OverflowError, OSError, ValueError):
+            when = datetime.fromtimestamp(card.sent_ts, UTC).strftime("%Y-%m-%d %H:%M")
+    chain = card.chain_id or ""
+    if chain:
+        chain = (chain_subjects or {}).get(chain) or chain
     return [
         when,
         _person(card.sender),
@@ -96,9 +107,12 @@ def export_results(
 ) -> ExportInfo:
     """Write up to ``max_rows`` cards to ``out_path`` and say how many rows went in and if the rest was cut.
 
-    The Chain column shows ``chain_subjects[chain_id]`` when given, else the chain id. The workbook is
-    saved beside ``out_path`` first and renamed, so a half-written file never sits at ``out_path``.
+    The Chain column shows ``chain_subjects[chain_id]`` when it is given and not empty, else the chain id.
+    The workbook is saved beside ``out_path`` first and renamed, so a half-written file never sits at
+    ``out_path``. A negative ``max_rows`` raises ``ValueError``; zero writes the header only.
     """
+    if max_rows < 0:
+        raise ValueError(f"max_rows must not be negative, got {max_rows}")
     out_path = Path(out_path)
     kept = messages[:max_rows]
     truncated = len(messages) > max_rows
@@ -132,12 +146,16 @@ def export_results(
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
+    # Serialise in memory so a failing save never leaves openpyxl holding the temp file open.
+    buffer = io.BytesIO()
+    wb.save(buffer)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     temp = out_path.with_name(f"{out_path.name}.{os.getpid()}.tmp")
     try:
-        wb.save(temp)
+        temp.write_bytes(buffer.getvalue())
         os.replace(temp, out_path)
     except BaseException:
-        temp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            temp.unlink(missing_ok=True)
         raise
     return ExportInfo(path=out_path, rows=len(kept), truncated=truncated)
