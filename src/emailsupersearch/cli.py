@@ -174,3 +174,64 @@ def _configure_sync(parser: argparse.ArgumentParser) -> None:
 
 
 register("sync", _sync, _configure_sync)
+
+
+def _port(text: str) -> int:
+    value = _positive_int(text)
+    if value > 65535:
+        raise argparse.ArgumentTypeError(f"{value} is not a port number")
+    return value
+
+
+def _serve(args: argparse.Namespace) -> int:
+    """Start the host and open the browser on it (or on the host already running); runs until stopped."""
+    # Imported here, not at the top: the launcher's start-up loads native modules, see `_bench`.
+    from emailsupersearch.host.launcher import resolve_root, serve
+
+    return serve(resolve_root(), args.port, args.headless, open_browser=not args.no_browser)
+
+
+def _configure_serve(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--port", type=_port, help="port to listen on (default: the saved setting, else 8765)")
+    parser.add_argument(
+        "--headless", action="store_true", help="print nothing; console output goes to logs/host-stderr.log"
+    )
+    parser.add_argument("--no-browser", action="store_true", help="do not open the browser")
+
+
+register("serve", _serve, _configure_serve)
+
+
+def _stop(args: argparse.Namespace) -> int:
+    """Stop the running host."""
+    from emailsupersearch.host.launcher import resolve_root, stop
+
+    return stop(resolve_root())
+
+
+register("stop", _stop, lambda parser: None)
+
+
+def _purge(args: argparse.Namespace) -> int:
+    """Stop the host, then remove the data root: every project, index, cache and log."""
+    if not args.yes:
+        print("refusing to purge without --yes", file=sys.stderr)
+        return 2
+    from emailsupersearch.host.launcher import remove_root, resolve_root, stop
+
+    root = resolve_root()
+    if stop(root) != 0:
+        print("the host did not stop; nothing was removed", file=sys.stderr)
+        return 1
+    problem = remove_root(root)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
+    return 0
+
+
+def _configure_purge(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--yes", action="store_true", help="confirm: every project, index, cache and log is deleted")
+
+
+register("purge", _purge, _configure_purge)
