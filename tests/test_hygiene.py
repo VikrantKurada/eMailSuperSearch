@@ -101,5 +101,33 @@ def test_new_text_of_blank_body_is_empty():
 
 
 def test_strip_signature_trailing_run_longer_than_six_lines_is_kept():
-    body = "a\nb\nc\nd\ne\nf\nT: +44 20 7946 0000"
+    body = "Hi.\n\na\nb\nc\nd\ne\nf\nT: +44 20 7946 0000"
     assert strip_signature(body) == body
+
+
+def test_strip_signature_date_is_not_a_phone_number():
+    body = "Deadline: 2026-10-24\nPlease confirm."
+    assert strip_signature(body) == body
+    body = "Done.\n\nDeadline: 2026-10-24\nPlease confirm."
+    assert strip_signature(body) == body
+
+
+def test_strip_signature_uk_phone_formats_are_phone_numbers():
+    assert strip_signature("Done.\n\nMei Lin\n020 7946 0000").strip() == "Done."
+    assert strip_signature("Done.\n\nMei Lin\n+44 20 7946 0000").strip() == "Done."
+
+
+def test_strip_signature_trailing_block_is_anchored_at_a_blank_line():
+    no_blank = "Please confirm.\nMei Lin\n+44 20 7946 0000"
+    assert strip_signature(no_blank) == no_blank
+    with_blank = "Please confirm.\n\nMei Lin\n+44 20 7946 0000"
+    assert strip_signature(with_blank).strip() == "Please confirm."
+
+
+def test_strip_signature_trailing_block_with_a_long_line_is_kept():
+    body = "Done.\n\nCall me on +44 20 7946 0000 about the 4% uplift we discussed with the team.\nMei"
+    assert strip_signature(body) == body
+
+
+def test_strip_signature_trailing_block_ignores_trailing_blank_lines():
+    assert strip_signature("Done.\n\nMei Lin\n+44 20 7946 0000\n\n  \n").strip() == "Done."

@@ -36,6 +36,7 @@ _SIGNATURE_MARKERS = (
 )
 
 _PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
+_PHONE_MIN_DIGITS = 9  # excludes dates such as 2026-10-24 (8 digits)
 _SIGNATURE_MAX_LINES = 6
 _SIGNATURE_MAX_LINE_LENGTH = 60  # a signature line is shorter than this
 
@@ -55,26 +56,36 @@ def strip_quoted(body: str) -> str:
     return body if cut is None else cut
 
 
-def _strip_trailing_phone_block(body: str) -> str:
-    """Remove a trailing block of at most 6 short non-empty lines that has a phone number.
+def _has_phone_number(line: str) -> bool:
+    """True if the line holds a phone-number-shaped run of at least 9 digits."""
+    return any(
+        sum(ch.isdigit() for ch in m.group()) >= _PHONE_MIN_DIGITS for m in _PHONE.finditer(line)
+    )
 
-    The block is the whole run of short lines at the end of the body, bounded above by
-    a blank line or a long line. A longer run is body text, not a signature, so it stays.
+
+def _strip_trailing_phone_block(body: str) -> str:
+    """Remove the last paragraph when it looks like a signature block.
+
+    A signature is separated from the text by a blank line, so only the run of lines after
+    the last blank line is considered, and only when a blank line precedes it. It goes when
+    it has at most 6 lines, each under 60 characters, and at least one holds a phone number.
     """
     lines = body.split("\n")
     end = len(lines)
     while end and not lines[end - 1].strip():
         end -= 1
     start = end
-    while (
-        start > 0
-        and lines[start - 1].strip()
-        and len(lines[start - 1].strip()) < _SIGNATURE_MAX_LINE_LENGTH
-    ):
+    while start > 0 and lines[start - 1].strip():
         start -= 1
+    if start == 0:
+        return body  # no blank line above the last paragraph: nothing separates a signature
     block = lines[start:end]
-    if 0 < len(block) <= _SIGNATURE_MAX_LINES and any(_PHONE.search(line) for line in block):
-        return "\n".join(lines[:start]) + "\n" if start else ""
+    if (
+        0 < len(block) <= _SIGNATURE_MAX_LINES
+        and all(len(line.strip()) < _SIGNATURE_MAX_LINE_LENGTH for line in block)
+        and any(_has_phone_number(line) for line in block)
+    ):
+        return "\n".join(lines[:start]) + "\n"
     return body
 
 
