@@ -17,17 +17,20 @@ _FLAGS = re.MULTILINE | re.IGNORECASE
 # "On Tue, Mar 3 Priya wrote:"
 _ON_WROTE = re.compile(r"^On .+ wrote:[ \t]*$", _FLAGS)
 
-# Quoted-reply markers. Each match starts at a line start, and the body is cut there.
-_QUOTE_MARKERS = (
-    _ON_WROTE,
+# Markers that open a block of earlier messages (everything after them is history).
+_HISTORY_MARKERS = (
     # Outlook header block: a From: line with a Sent: or To: line within the next 4 lines.
     re.compile(r"^From: .+(?:\n.*){0,3}\n(?:Sent: |To: )", _FLAGS),
     re.compile(r"^-----[ \t]*Original Message[ \t]*-----", _FLAGS),
-    # A run of one or more lines starting with ">" begins at its first line.
-    re.compile(r"^>", _FLAGS),
     # Outlook's "________________________________" separator.
     re.compile(r"^_{20,}[ \t]*$", _FLAGS),
 )
+
+# A run of one or more lines starting with ">" begins at its first line.
+_QUOTED_LINE = re.compile(r"^>", _FLAGS)
+
+# Quoted-reply markers. Each match starts at a line start, and the body is cut there.
+_QUOTE_MARKERS = (_ON_WROTE, *_HISTORY_MARKERS, _QUOTED_LINE)
 
 # Signature markers: the body is cut at the first of them.
 _SIGNATURE_MARKERS = (
@@ -62,11 +65,17 @@ def _is_interleaved(body: str) -> bool:
 
     That is: after the first run of ``>`` lines there is a non-blank line that is not
     quoted. Scanning stops at a signature or quote marker line, because what follows
-    it is a signature or older history, not an answer.
+    it is a signature or older history, not an answer. A history marker (Outlook header
+    block, Original Message, underscore separator) before the first run means that run
+    is inside the quoted history, so the body is not interleaved.
     """
     first_run = _QUOTED_RUN.search(body)
     if first_run is None:
         return False
+    for marker in _HISTORY_MARKERS:
+        found = marker.search(body)
+        if found is not None and found.start() < first_run.start():
+            return False
     for line in _NON_BLANK_LINE.finditer(body, first_run.end()):
         if line.group().startswith(">"):
             continue

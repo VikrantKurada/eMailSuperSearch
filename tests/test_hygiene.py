@@ -173,7 +173,7 @@ def test_interleaved_reply_drops_on_wrote_header_but_keeps_answers():
     assert "A1." in result and "A2." in result
 
 
-def test_bottom_posted_reply_still_cut():
+def test_top_posted_reply_still_cut():
     body = "Yes.\n\nOn Tue, Mar 3 Priya wrote:\n> old\n> text"
     assert strip_quoted(body).strip() == "Yes."
     assert new_text(body, has_parent=True) == "Yes."
@@ -182,4 +182,27 @@ def test_bottom_posted_reply_still_cut():
 def test_quote_followed_only_by_signature_is_not_interleaved():
     body = "Yes.\n\nOn Tue Priya wrote:\n> old\n\n-- \nMei Lin\nFinance"
     assert strip_quoted(body).strip() == "Yes."
+    assert new_text(body, has_parent=True) == "Yes."
+
+
+def test_original_message_block_above_quote_is_cut():
+    probe = (
+        "Yes.\n\n-----Original Message-----\nFrom: Priya\nSent: Monday\nTo: Daniel\n"
+        "Subject: Acme\n\nHi Daniel,\n> earlier quote\nThanks all\nPriya"
+    )
+    assert new_text(probe, has_parent=True) == "Yes."
+    only_marker = "Yes.\n\n-----Original Message-----\nHi Daniel,\n> earlier quote\nThanks all\nPriya"
+    assert new_text(only_marker, has_parent=True) == "Yes."
+
+
+def test_outlook_header_block_above_quote_is_cut():
+    body = (
+        "Yes.\n\nFrom: Priya\nSent: Monday\nTo: Daniel\nSubject: Acme\n\n"
+        "Hi Daniel,\n> earlier quote\nThanks all\nPriya"
+    )
+    assert new_text(body, has_parent=True) == "Yes."
+
+
+def test_underscore_separator_above_quote_is_cut():
+    body = "Yes.\n\n________________________________\nHi Daniel,\n> earlier quote\nThanks all\nPriya"
     assert new_text(body, has_parent=True) == "Yes."
