@@ -150,11 +150,40 @@ def _attachment_bytes(part: EmailMessage) -> bytes:
     return payload if isinstance(payload, bytes) else part.as_bytes()
 
 
-def _attachments(msg: EmailMessage, mtime: int) -> list[ParsedAttachment]:
+def _leaves(part: EmailMessage):
+    """Every non-multipart descendant of ``part`` in document order, at any nesting depth.
+
+    A ``message/rfc822`` part is a leaf: its own parts belong to the message inside it.
+    """
+    if part.get_content_type() == "message/rfc822" or part.get_content_maintype() != "multipart":
+        yield part
+        return
+    for sub in part.iter_parts():
+        yield from _leaves(sub)
+
+
+def _is_attachment(part: EmailMessage) -> bool:
+    return (
+        part.is_attachment()
+        or part["Content-ID"] is not None
+        or bool(part.get_filename())
+        or part.get_content_maintype() != "text"
+    )
+
+
+def _attachments(
+    msg: EmailMessage, mtime: int, bodies: tuple[EmailMessage | None, ...]
+) -> list[ParsedAttachment]:
+    """Attachments and inline parts at any depth: HTML mail nests its images under alternative > related."""
     found: list[ParsedAttachment] = []
-    for ordinal, part in enumerate(msg.iter_attachments()):
-        filename = part.get_filename() or f"part-{ordinal}"
+    for part in _leaves(msg):
+        if any(part is body for body in bodies):
+            continue
         mime = part.get_content_type()
+        if mime != "message/rfc822" and not _is_attachment(part):
+            continue
+        ordinal = len(found)
+        filename = part.get_filename() or f"part-{ordinal}"
         nested = None
         if mime == "message/rfc822":
             inner = part.get_content()
@@ -202,7 +231,7 @@ def _convert(msg: EmailMessage, mtime: int) -> ParsedMessage:
         references=_ids(msg, "References"),
         conversation_index=None,
         conversation_topic=None,
-        attachments=_attachments(msg, mtime),
+        attachments=_attachments(msg, mtime, (plain, html_part)),
     )
 
 

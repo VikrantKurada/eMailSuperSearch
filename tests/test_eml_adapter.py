@@ -1,3 +1,5 @@
+import email
+import email.policy
 import os
 from datetime import UTC, datetime
 from email.message import EmailMessage
@@ -234,6 +236,59 @@ def test_content_id_is_kept_without_brackets(tmp_path):
     m.add_related(b"pngdata", "image", "png", cid="<logo@x>", filename="logo.png")
     atts = parse_eml(write(tmp_path, m)).attachments
     assert [(a.filename, a.kind, a.content_id) for a in atts] == [("logo.png", "image", "logo@x")]
+
+
+def test_parse_eml_finds_inline_image_nested_in_related(tmp_path):
+    m = base_message()
+    m.set_content("plain version")
+    m.add_alternative("<p>logo <img src='cid:logo@x'></p>", subtype="html")
+    m.get_payload()[1].add_related(b"pngdata", "image", "png", cid="<logo@x>", disposition="inline")
+    m.make_mixed()
+    raw = m.as_bytes()
+    shape = [p.get_content_type() for p in email.message_from_bytes(raw, policy=email.policy.default).walk()]
+    assert shape == [
+        "multipart/mixed",
+        "multipart/alternative",
+        "text/plain",
+        "multipart/related",
+        "text/html",
+        "image/png",
+    ]
+    parsed = parse_eml(write(tmp_path, raw))
+    assert [(a.kind, a.content_id, a.data) for a in parsed.attachments] == [("image", "logo@x", b"pngdata")]
+    assert parsed.body_text.strip() == "plain version" and "cid:logo@x" in parsed.body_html
+
+
+def test_attachments_are_found_in_nested_multiparts_in_walk_order(tmp_path):
+    m = base_message()
+    m.set_content("see attached")
+    m.add_attachment(b"first", maintype="application", subtype="pdf", filename="one.pdf")
+    inner = EmailMessage()
+    inner.set_content("wrapper text", subtype="plain")
+    inner.add_attachment(b"second", maintype="application", subtype="pdf", filename="two.pdf")
+    m.get_payload().append(inner)
+    m.add_attachment(b"third", maintype="application", subtype="pdf", filename="three.pdf")
+    atts = parse_eml(write(tmp_path, m)).attachments
+    assert [(a.ordinal, a.filename) for a in atts] == [(0, "one.pdf"), (1, "two.pdf"), (2, "three.pdf")]
+
+
+def test_nested_message_keeps_its_own_attachments(tmp_path):
+    inner = base_message(Subject="inner")
+    inner.set_content("deep")
+    inner.add_attachment(b"inner-doc", maintype="application", subtype="pdf", filename="deep.pdf")
+    outer = base_message()
+    outer.set_content("hi")
+    outer.add_attachment(inner)
+    parsed = parse_eml(write(tmp_path, outer))
+    assert [a.kind for a in parsed.attachments] == ["eml"]
+    assert [a.filename for a in parsed.attachments[0].nested.attachments] == ["deep.pdf"]
+
+
+def test_text_part_without_attachment_markers_is_not_an_attachment(tmp_path):
+    m = base_message()
+    m.set_content("plain version")
+    m.add_alternative("BEGIN:VCALENDAR\nEND:VCALENDAR\n", subtype="calendar")
+    assert parse_eml(write(tmp_path, m)).attachments == []
 
 
 def test_conversation_fields_are_none(tmp_path):

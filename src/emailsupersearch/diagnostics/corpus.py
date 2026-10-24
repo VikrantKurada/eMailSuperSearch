@@ -209,7 +209,8 @@ _ATTACHMENT_MIME = {
 
 
 def _sent_at(thread: int, index: int) -> datetime:
-    return _FIRST_SENT + timedelta(days=7 * thread, hours=3 * index)
+    # Weekly per thread, wrapping at 350 days so every Date stays in 2026 however many threads.
+    return _FIRST_SENT + timedelta(days=(7 * thread) % 350, hours=3 * index)
 
 
 def _signature(person: Person) -> str:

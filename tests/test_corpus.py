@@ -51,6 +51,7 @@ def test_generate_corpus_is_deterministic(tmp_path):
     assert [p.name for p in a] == [p.name for p in b] and all(
         x.read_bytes() == y.read_bytes() for x, y in zip(a, b)
     )
+    assert all(datetime.fromtimestamp(parse_eml(p).sent_ts, UTC).year == 2026 for p in a)
 
 
 def test_generate_covers_all_attachment_kinds(tmp_path):
@@ -93,6 +94,15 @@ def test_dates_are_utc_2026_three_hours_apart(tmp_path):
     assert thread0[0].sent_ts == int(datetime(2026, 1, 5, 9, 0, tzinfo=UTC).timestamp())
     assert [b.sent_ts - a.sent_ts for a, b in itertools.pairwise(thread0)] == [3 * 3600] * (len(thread0) - 1)
     assert all(datetime.fromtimestamp(parse_eml(p).sent_ts, UTC).year == 2026 for p in paths)
+
+
+def test_dates_stay_in_2026_however_many_threads(tmp_path):
+    paths = generate(tmp_path, 60, seed=1)
+    years = {datetime.fromtimestamp(parse_eml(p).sent_ts, UTC).year for p in paths}
+    assert years == {2026}
+    single = tmp_path / "single.eml"
+    single.write_bytes(make_eml_bytes())
+    assert datetime.fromtimestamp(parse_eml(single).sent_ts, UTC).year == 2026
 
 
 def test_message_ids_and_references_chain_the_thread(tmp_path):
