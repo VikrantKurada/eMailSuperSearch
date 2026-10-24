@@ -108,3 +108,10 @@ def count_messages(conn: sqlite3.Connection, f: SearchFilters) -> int:
     """How many live messages pass the filters: the total behind the pages of ``messages_by_date``."""
     where, params = _where(f)
     return int(conn.execute("SELECT COUNT(*) FROM messages m WHERE " + where, params).fetchone()[0])
+
+
+def count_chains(conn: sqlite3.Connection, f: SearchFilters) -> int:
+    """How many chains the live messages passing the filters belong to; a message without a chain is one of its own."""
+    where, params = _where(f)
+    sql = "SELECT COUNT(DISTINCT COALESCE(m.chain_id, m.message_key)) FROM messages m WHERE " + where
+    return int(conn.execute(sql, params).fetchone()[0])

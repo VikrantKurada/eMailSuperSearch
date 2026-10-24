@@ -70,6 +70,8 @@ def test_filter_only_search_returns_by_date(indexed_store, embedder):
     assert ts and ts == sorted(ts, reverse=True)
     assert r.total_messages > len(r.messages) == PAGE_SIZE
     assert all(m.score == 0.0 and m.snippet == "" for m in r.messages)
+    grouped = search(indexed_store, embedder, SearchFilters(query="", date_from=0))
+    assert r.total_chains == grouped.total_chains > len({m.chain_id for m in r.messages})  # every match, not the page
 
 
 def test_tombstoned_message_hidden_from_search_before_purge(indexed_store, embedder):
@@ -96,6 +98,25 @@ def test_related_chains_share_participants(indexed_store, embedder):
     assert any(c.related for c in r.chains)
     for c in r.chains:
         assert len(c.related) <= 3 and all(cid != c.chain_id and subject for cid, subject in c.related)
+
+
+def test_related_chain_hidden_when_tombstoned(indexed_store, embedder):
+    store = indexed_store
+
+    def related_ids():
+        r = search(store, embedder, SearchFilters(query="budget"), page_size=100)
+        return [cid for c in r.chains for cid, _ in c.related]
+
+    target = related_ids()[0]
+    keys = [row[0] for row in store.read_conn().execute("SELECT message_key FROM messages WHERE chain_id = ?", (target,))]
+    paths = [path for key in keys for path in store.paths_for_message(key)]
+    assert paths
+    store.tombstone(paths, now=3)
+    try:
+        assert target not in related_ids()
+    finally:
+        with store.lock, store.conn:
+            store.conn.executemany("UPDATE files SET tombstoned_at = NULL WHERE path = ?", [(p,) for p in paths])
 
 
 def test_snippet_strips_context_line_and_is_bounded(indexed_store):

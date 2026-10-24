@@ -19,9 +19,13 @@ from typing import TYPE_CHECKING, Literal
 
 from emailsupersearch.index.fts import keyword_search
 from emailsupersearch.index.vectors import VectorIndex
+from emailsupersearch.ingest.attachments import INLINE_IMAGE_MIN_BYTES
+from emailsupersearch.ingest.identity import normalize_subject
 from emailsupersearch.search.filters import (
+    LIVE_MESSAGE_SQL,
     candidate_message_keys,
     chunk_rowids_for,
+    count_chains,
     count_messages,
     messages_by_date,
 )
@@ -71,24 +75,30 @@ _CHAINS_SQL = (
     "SELECT chain_id, subject, first_ts, last_ts, message_count, participants_json FROM chains"
     " WHERE chain_id IN (SELECT value FROM json_each(?))"
 )
-# Written with exactly ``lower(sender_addr)`` and ``lower(addr)`` so SQLite uses the expression indexes; the
-# addresses are bound lower-cased.
+# Related chains count only live messages (``LIVE_MESSAGE_SQL``), so a chain whose files are all tombstoned is never
+# linked. Written with exactly ``lower(sender_addr)`` and ``lower(addr)`` so SQLite uses the expression indexes; the
+# addresses are bound lower-cased. Recipients are ``to`` and ``cc`` only, like a chain's own participants.
 _RELATED_BY_PEOPLE = (
     "SELECT chain_id, COUNT(DISTINCT addr) FROM ("
     "SELECT m.chain_id, lower(m.sender_addr) AS addr FROM messages m"
-    " WHERE lower(m.sender_addr) IN (SELECT value FROM json_each(?))"
+    f" WHERE lower(m.sender_addr) IN (SELECT value FROM json_each(?)) AND {LIVE_MESSAGE_SQL}"
     " UNION SELECT m.chain_id, lower(r.addr) FROM recipients r JOIN messages m ON m.message_key = r.message_key"
-    " WHERE lower(r.addr) IN (SELECT value FROM json_each(?)))"
+    f" WHERE lower(r.addr) IN (SELECT value FROM json_each(?)) AND r.kind IN ('to', 'cc') AND {LIVE_MESSAGE_SQL})"
     " WHERE chain_id IS NOT NULL AND chain_id != ? GROUP BY chain_id HAVING COUNT(DISTINCT addr) >= 2"
     " ORDER BY COUNT(DISTINCT addr) DESC, chain_id LIMIT 3"
 )
+# A shared image smaller than ``INLINE_IMAGE_MIN_BYTES`` is a logo or signature, so it links nothing (both sides).
 _RELATED_BY_ATTACHMENT = (
     "SELECT DISTINCT m.chain_id FROM attachments a JOIN messages m ON m.message_key = a.message_key"
     " WHERE a.sha256 IN (SELECT a2.sha256 FROM attachments a2 JOIN messages m2 ON m2.message_key = a2.message_key"
-    " WHERE m2.chain_id = ? AND a2.sha256 IS NOT NULL)"
-    " AND m.chain_id IS NOT NULL AND m.chain_id != ? ORDER BY m.chain_id LIMIT 3"
+    " WHERE m2.chain_id = ? AND a2.sha256 IS NOT NULL AND NOT (a2.kind = 'image' AND a2.size < ?))"
+    " AND NOT (a.kind = 'image' AND a.size < ?)"
+    f" AND m.chain_id IS NOT NULL AND m.chain_id != ? AND {LIVE_MESSAGE_SQL} ORDER BY m.chain_id LIMIT 3"
 )
-_SUBJECTS_SQL = "SELECT chain_id, subject FROM chains WHERE chain_id IN (SELECT value FROM json_each(?))"
+_SUBJECTS_SQL = (
+    "SELECT c.chain_id, c.subject FROM chains c WHERE c.chain_id IN (SELECT value FROM json_each(?))"
+    f" AND EXISTS (SELECT 1 FROM messages m WHERE m.chain_id = c.chain_id AND {LIVE_MESSAGE_SQL})"
+)
 
 
 def rrf(ranked_lists: list[list[int]], k: int = RRF_K) -> dict[int, float]:
@@ -155,7 +165,7 @@ def _attachments(conn: sqlite3.Connection, keys_json: str) -> dict[str, list[Att
         _ATTACHMENTS_SQL, (keys_json,)
     ).fetchall():
         found.setdefault(key, []).append(
-            AttachmentInfo(ordinal, filename or "", kind, size, extract, ocr, bool(partial), pages)
+            AttachmentInfo(ordinal, filename or "", kind or "other", size, extract, ocr, bool(partial), pages)
         )
     return found
 
@@ -191,12 +201,22 @@ def build_message_cards(
 
 
 def _participants(raw: str | None) -> dict[str, list[Person]]:
-    """A ``chains.participants_json`` value as ``Person`` lists under ``from``, ``to`` and ``cc``."""
-    data = json.loads(raw) if raw else {}
-    return {
-        kind: [Person(p.get("name") or "", p.get("addr") or "") for p in data.get(kind, [])]
-        for kind in ("from", "to", "cc")
-    }
+    """A ``chains.participants_json`` value as ``Person`` lists under ``from``, ``to`` and ``cc``.
+
+    A value that is not valid JSON or not an object gives empty lists, as does a key whose value is not a list.
+    """
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    participants: dict[str, list[Person]] = {}
+    for kind in ("from", "to", "cc"):
+        found = data.get(kind)
+        people = found if isinstance(found, list) else []
+        participants[kind] = [Person(p.get("name") or "", p.get("addr") or "") for p in people if isinstance(p, dict)]
+    return participants
 
 
 def _distinct(people: list[Person]) -> list[Person]:
@@ -227,7 +247,8 @@ def _chain_card(chain_id: str, members: list[MessageCard], row: Sequence | None)
         "cc": _distinct([p for card in members for p in card.cc]),
     }
     return ChainCard(
-        chain_id, members[0].subject, min(dated, default=None), max(dated, default=None), len(members),
+        chain_id, normalize_subject(members[0].subject), min(dated, default=None), max(dated, default=None),
+        len(members),
         participants, None, attachments, [], members, score,
     )
 
@@ -251,14 +272,16 @@ def group_chains(cards: list[MessageCard], conn: sqlite3.Connection) -> list[Cha
 
 
 def _related(conn: sqlite3.Connection, chains: list[ChainCard]) -> None:
-    """Fill each chain's ``related``: up to 3 other chains that share at least 2 participant addresses or an
-    attachment sha256. Participant matches come first, most shared addresses first, then attachment matches."""
+    """Fill each chain's ``related``: up to 3 other chains with a live message that share at least 2 participant
+    addresses or an attachment sha256. Participant matches come first, most shared addresses first, then attachment
+    matches."""
     found: dict[str, list[str]] = {}
     for chain in chains:
         addrs = sorted({p.addr.strip().lower() for people in chain.participants.values() for p in people})
         addrs_json = json.dumps([addr for addr in addrs if addr])
         ids = [row[0] for row in conn.execute(_RELATED_BY_PEOPLE, (addrs_json, addrs_json, chain.chain_id)).fetchall()]
-        ids += [row[0] for row in conn.execute(_RELATED_BY_ATTACHMENT, (chain.chain_id, chain.chain_id)).fetchall()]
+        by_attachment = (chain.chain_id, INLINE_IMAGE_MIN_BYTES, INLINE_IMAGE_MIN_BYTES, chain.chain_id)
+        ids += [row[0] for row in conn.execute(_RELATED_BY_ATTACHMENT, by_attachment).fetchall()]
         found[chain.chain_id] = list(dict.fromkeys(ids))[:_MAX_RELATED]
     wanted = sorted({cid for ids in found.values() for cid in ids})
     subjects = {cid: subject for cid, subject in conn.execute(_SUBJECTS_SQL, (json.dumps(wanted),)).fetchall()}
@@ -295,14 +318,15 @@ def _grouped(
 def _filter_only(conn: sqlite3.Connection, f: SearchFilters, page: int, page_size: int, mode: _Mode) -> SearchResponse:
     """An empty query lists the matching messages newest first, unscored and without snippets.
 
-    Ungrouped, ``total_chains`` counts only the chains of the page's messages. Grouped, only the newest
-    ``FILTER_ONLY_GROUP_LIMIT`` messages are grouped, so ``total_chains`` counts the chains among those.
+    Ungrouped, ``total_chains`` counts the chains of every match (``count_chains``). Grouped, only the newest
+    ``FILTER_ONLY_GROUP_LIMIT`` messages are grouped, so ``total_chains`` counts the chains among those, which is
+    what the pages can show.
     """
     total = count_messages(conn, f)
     if not f.group_by_chain:
         keys = messages_by_date(conn, f, page_size, page * page_size)
         cards = build_message_cards(conn, [(key, 0.0, None) for key in keys], {})
-        return SearchResponse(total, _chain_count(cards), page, page_size, [], cards, mode)
+        return SearchResponse(total, count_chains(conn, f), page, page_size, [], cards, mode)
     keys = messages_by_date(conn, f, FILTER_ONLY_GROUP_LIMIT, 0)
     cards = build_message_cards(conn, [(key, 0.0, None) for key in keys], {})
     return _grouped(conn, cards, total, page, page_size, mode, by_date=True)
@@ -320,7 +344,7 @@ def search(
     Without an embedder only the keyword ranking is used (``mode == "keyword_only"``). ``f.sort == "date"`` orders
     the fused results by date, newest first; otherwise they are ordered by fused score. An empty query lists the
     filtered messages by date instead. The totals count every surviving message and chain, not just the page
-    (``_filter_only`` notes where an empty query's chain total falls short of that).
+    (``_filter_only`` notes the one cap on an empty query's chain total).
     """
     conn = store.read_conn()
     mode: _Mode = "hybrid" if embedder is not None else "keyword_only"

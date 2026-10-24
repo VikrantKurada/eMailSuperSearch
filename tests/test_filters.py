@@ -6,6 +6,8 @@ from emailsupersearch.ingest.chunker import ChunkText
 from emailsupersearch.search.filters import (
     candidate_message_keys,
     chunk_rowids_for,
+    count_chains,
+    count_messages,
     messages_by_date,
 )
 from emailsupersearch.store import FileRecord
@@ -192,3 +194,13 @@ def test_messages_by_date_orders_pages_and_filters(seeded):
     assert messages_by_date(seeded.conn, senders, 10, 0) == ["m2", "m1"]
     assert messages_by_date(seeded.conn, senders, 1, 1) == ["m1"]
 
+
+def test_count_messages_and_chains(seeded):
+    with seeded.store.lock, seeded.store.conn:
+        seeded.store.conn.execute("UPDATE messages SET chain_id = 'c1' WHERE message_key IN ('m1', 'm2')")
+    everything = SearchFilters()
+    assert count_messages(seeded.conn, everything) == 4
+    assert count_chains(seeded.conn, everything) == 3  # m1 and m2 share c1; m3 and m4 have no chain, one each
+    assert count_chains(seeded.conn, SearchFilters(from_addrs=["bob@example.org", "carol@example.org"])) == 2
+    seeded.store.tombstone(["/mail/m3.eml"], now=1)
+    assert count_messages(seeded.conn, everything) == 3 and count_chains(seeded.conn, everything) == 2
