@@ -211,7 +211,8 @@ print(json.dumps(result))
 
 def _probe_modules() -> ProbeResult:
     names = [*REQUIRED_MODULES, *OPTIONAL_MODULES]
-    command = [sys.executable, "-c", _PROBE_SCRIPT, json.dumps(names)]
+    # -P keeps the working directory off the child's sys.path, so a planted json.py cannot run.
+    command = [sys.executable, "-P", "-c", _PROBE_SCRIPT, json.dumps(names)]
     try:
         proc = subprocess.run(
             command,
@@ -257,19 +258,27 @@ def _path_key(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
 
+def _powershell_exe() -> str:
+    """Windows PowerShell by absolute path, so CreateProcess never picks one up from the working directory."""
+    system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return system32 if os.path.exists(system32) else "powershell"
+
+
 def _signer_statuses(binaries: list[str]) -> dict[str, str]:
     """Map each binary to `signed:<signer>` or `unsigned:<status>` with one PowerShell call."""
-    quoted = ",".join("'" + path.replace("'", "''") + "'" for path in binaries)
-    # The result travels as base64 of UTF-8 JSON: a redirected PowerShell 5.1 writes in the OEM
-    # code page, which would mangle accented folder names and signer names.
+    # The paths travel as base64 of UTF-8 JSON and are never spliced into the script text (PowerShell
+    # also reads U+2018/2019/201A/201B as quotes). The result comes back the same way, because a
+    # redirected PowerShell 5.1 writes in the OEM code page, which would mangle accented names.
+    token = base64.b64encode(json.dumps(binaries).encode("utf-8")).decode("ascii")
     script = (
-        "$rows = @(Get-AuthenticodeSignature -LiteralPath " + quoted + " | Select-Object Path, "
+        f"$paths = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{token}'))); "
+        "$rows = @(Get-AuthenticodeSignature -LiteralPath $paths | Select-Object Path, "
         "@{n='Status';e={[string]$_.Status}}, @{n='Subject';e={$_.SignerCertificate.Subject}}); "
         "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $rows)))"
     )
     try:
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", script],
             check=False,
             capture_output=True,
             text=True,

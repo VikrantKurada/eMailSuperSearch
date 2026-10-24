@@ -1,6 +1,9 @@
+import base64
 import ctypes
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -182,6 +185,58 @@ def test_signer_statuses_runs_powershell_on_real_files(tmp_path):
     got = doctor._signer_statuses([str(unsigned), str(system_dll)])
     assert got[doctor._path_key(str(unsigned))].startswith("unsigned:")
     assert got[doctor._path_key(str(system_dll))] == "signed:Microsoft Windows"
+
+
+@windows_only
+@pytest.mark.parametrize("quote", ["\u2018", "\u2019", "\u201a", "\u201b", "'", "`", "$(whoami)"])
+def test_signer_statuses_survives_quote_characters_in_a_file_name(tmp_path, quote):
+    # PowerShell treats the typographic single quotes like ASCII ones inside '...' strings,
+    # so paths must reach the script as data (base64 JSON), never as interpolated text.
+    copy = tmp_path / f"bob{quote}s.dll"
+    shutil.copyfile(Path(os.environ["SystemRoot"]) / "System32" / "kernel32.dll", copy)
+    got = doctor._signer_statuses([str(copy)])
+    assert got[doctor._path_key(str(copy))].startswith(("signed:", "unsigned:"))
+
+
+def test_powershell_exe_prefers_the_system32_copy(monkeypatch, tmp_path):
+    exe = tmp_path / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    assert doctor._powershell_exe() == str(exe)
+    exe.unlink()
+    assert doctor._powershell_exe() == "powershell"
+
+
+def test_probe_child_runs_without_the_working_directory_on_sys_path(monkeypatch):
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="{}\n", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    doctor._probe_modules()
+    assert seen[0][:3] == [sys.executable, "-P", "-c"]
+
+
+def test_signer_script_carries_paths_as_base64_json_and_uses_the_resolved_powershell(monkeypatch):
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    monkeypatch.setattr(doctor, "_powershell_exe", lambda: r"C:\fake\powershell.exe")
+    hostile = "C:\\site\\bob\u2019s [x]'; calc; '.dll"
+    with pytest.raises(doctor._SignerUnavailable):
+        doctor._signer_statuses([hostile])
+    command = seen[0]
+    script = command[command.index("-Command") + 1]
+    assert command[0] == r"C:\fake\powershell.exe" and "bob" not in script and "calc" not in script
+    token = re.search(r"FromBase64String\('([^']+)'\)", script).group(1)
+    assert json.loads(base64.b64decode(token).decode("utf-8")) == [hostile]
 
 
 def test_signer_name_prefers_the_common_name():
