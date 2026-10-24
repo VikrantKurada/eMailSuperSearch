@@ -8,11 +8,18 @@ import dataclasses
 import inspect
 import json
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
 from emailsupersearch import __version__
 from emailsupersearch.diagnostics.doctor import render_report, report_json, run_doctor
+from emailsupersearch.paths import (
+    data_root,
+    ensure_layout,
+    project_dir,
+    validate_data_root,
+)
 
 Handler = Callable[[argparse.Namespace], int]
 Configure = Callable[[argparse.ArgumentParser], None]
@@ -105,3 +112,61 @@ def _configure_bench(parser: argparse.ArgumentParser) -> None:
 
 
 register("bench", _bench, _configure_bench)
+
+
+def _embedding_dir() -> Path | None:
+    """The installed embedding model's folder, or None without the models package."""
+    try:
+        from emailsupersearch_models_en import embedding_dir
+    except ImportError:
+        return None
+    return embedding_dir()
+
+
+def _sync(args: argparse.Namespace) -> int:
+    """Reconcile a project's mail folders and index what changed; with --once, one pass and exit."""
+    root = data_root()
+    reason = validate_data_root(root)
+    if reason is not None:
+        print(reason, file=sys.stderr)
+        return 2
+    ensure_layout(root)
+    # Imported here, not at the top, for the reason given in `_bench`.
+    from emailsupersearch.index.embedder import load_default_embedder, tokenizer_path
+    from emailsupersearch.ingest.chunker import Chunker
+    from emailsupersearch.jobs.supervisor import build_project_supervisor
+    from emailsupersearch.store import ProjectStore
+
+    store = ProjectStore.open(project_dir(root, args.project))
+    embedder = load_default_embedder()
+    model_dir = _embedding_dir() if embedder is not None else None
+    chunker = Chunker(tokenizer_path(model_dir) if model_dir is not None else None)
+    sup = build_project_supervisor(args.project, store, embedder, chunker, root / "cache" / "parsed", on_event=None)
+    if args.once:
+        try:
+            r = sup.run_once()
+        finally:
+            sup.stop()
+        _print(
+            f"scan {r.scan_id}: parsed {len(r.to_parse)}, renamed {len(r.renamed)},"
+            f" tombstoned {len(r.tombstoned)}, purged {len(r.purged)}, errors {len(r.errors)}"
+        )
+        return 0
+    sup.start()
+    forever = threading.Event()
+    try:
+        while not forever.wait(1.0):  # a timed wait, so Ctrl+C is noticed on Windows too
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sup.stop()
+    return 0
+
+
+def _configure_sync(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project", required=True, help="the project's id")
+    parser.add_argument("--once", action="store_true", help="run one reconcile pass and exit")
+
+
+register("sync", _sync, _configure_sync)

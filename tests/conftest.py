@@ -204,3 +204,61 @@ def pipeline_with_queue(tmp_store, tmp_path, chunker, embedder_or_none, parse_po
     )
     pipeline.jobs = jobs
     return pipeline
+
+
+@pytest.fixture
+def make_supervisor(embedder_or_none, chunker):
+    """Build a supervisor over ``tmp_store`` through ``build_project_supervisor`` with the given reconcile interval
+    and OCR on or off; the events it emits are collected in ``sup.events_for_tests``.
+
+    The supervisor owns its parse pool and closes it, with the store, when it is stopped.
+    """
+    from emailsupersearch.jobs.supervisor import build_project_supervisor
+
+    def make(tmp_store, corpus_dir, interval_s, with_ocr):
+        tmp_store.set_setting("reconcile_interval_s", interval_s)
+        tmp_store.set_setting("ocr_enabled", with_ocr)
+        events: list[dict] = []
+        sup = build_project_supervisor(
+            "p", tmp_store, embedder_or_none, chunker, corpus_dir.parent / "cache", events.append
+        )
+        sup.events_for_tests = events
+        return sup
+
+    return make
+
+
+@pytest.fixture
+def sup(make_supervisor, tmp_store, corpus_dir):
+    """A supervisor with the default 900 s reconcile interval and no OCR; stopped at teardown."""
+    s = make_supervisor(tmp_store, corpus_dir, 900, False)
+    yield s
+    s.stop()
+
+
+@pytest.fixture
+def sup_fast(make_supervisor, tmp_store, corpus_dir):
+    """A supervisor that reconciles every second; no OCR."""
+    s = make_supervisor(tmp_store, corpus_dir, 1, False)
+    yield s
+    s.stop()
+
+
+@pytest.fixture
+def sup_slow(make_supervisor, tmp_store, corpus_dir):
+    """A supervisor whose timer never fires during a test (3600 s), so only the watcher can trigger a rescan."""
+    s = make_supervisor(tmp_store, corpus_dir, 3600, False)
+    yield s
+    s.stop()
+
+
+@pytest.fixture
+def sup_with_ocr(make_supervisor, tmp_store, corpus_dir):
+    """A supervisor with OCR wired; skipped when no OCR engine can run here."""
+    from emailsupersearch.ingest.ocr.base import select_engine
+
+    if select_engine("en") is None:
+        pytest.skip("no OCR engine: install the Windows OCR language pack or emailsupersearch[ocr]")
+    s = make_supervisor(tmp_store, corpus_dir, 900, True)
+    yield s
+    s.stop()

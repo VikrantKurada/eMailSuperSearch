@@ -572,3 +572,66 @@ def test_counts_metadata_only(tmp_store, parsed_factory, corpus_dir):
     tmp_store.upsert_file(_rec(os.path.join(root, "orphan.eml"), message_key=None, parse_status="failed"))
     tmp_store.tombstone([os.path.join(root, "ok.eml"), os.path.join(root, "orphan.eml")], 10)
     assert tmp_store.counts() == {"messages": 4, "chunks": 4, "files": 4, "tombstoned": 2, "metadata_only": 3}
+
+
+def test_retry_failed_files_resets_only_matching_failures(tmp_store, corpus_dir):
+    root = str(corpus_dir)
+    rows = {
+        "t.eml": ("failed", "timeout"),
+        "m.eml": ("failed", "memory_cap"),
+        "w.eml": ("failed", "worker died: BrokenProcessPool()"),
+        "p.eml": ("failed", "ParseError: bad header"),
+        "d.eml": ("failed", "memory-cap"),  # "_" is matched literally, not as a LIKE wildcard
+        "i.eml": ("indexed", "timeout"),  # not failed: left alone
+    }
+    for name, (status, reason) in rows.items():
+        tmp_store.upsert_file(_rec(os.path.join(root, name), parse_status=status, status_reason=reason))
+
+    assert tmp_store.retry_failed_files(("timeout", "memory_cap", "worker")) == 3
+
+    def state(name: str) -> tuple[str, str]:
+        rec = tmp_store.get_file(os.path.join(root, name))
+        return rec.parse_status, rec.status_reason
+
+    assert {n: state(n) for n in ("t.eml", "m.eml", "w.eml")} == dict.fromkeys(("t.eml", "m.eml", "w.eml"), ("pending", ""))
+    assert {n: state(n) for n in ("p.eml", "d.eml", "i.eml")} == {n: rows[n] for n in ("p.eml", "d.eml", "i.eml")}
+    assert tmp_store.retry_failed_files(()) == 0
+
+
+def test_orphan_message_keys_lists_messages_no_file_row_links(tmp_store, parsed_factory, corpus_dir):
+    root = str(corpus_dir)
+    for key in ("linked", "tombstoned", "orphan-b", "orphan-a"):
+        tmp_store.upsert_message(parsed_factory(message_id=f"<{key}@example.com>"), key, "t", None, 0)
+    tmp_store.upsert_file(_rec(os.path.join(root, "a.eml"), message_key="linked"))
+    tmp_store.upsert_file(_rec(os.path.join(root, "b.eml"), message_key="tombstoned"))
+    tmp_store.tombstone([os.path.join(root, "b.eml")], 10)  # a tombstoned row still links its message
+    tmp_store.upsert_file(_rec(os.path.join(root, "c.eml"), message_key=None))
+    assert tmp_store.orphan_message_keys() == ["orphan-a", "orphan-b"]
+
+
+def test_clear_index_drops_chunks_and_vectors_and_resets_live_files(tmp_store, corpus_dir):
+    root = str(corpus_dir)
+    tmp_store.write_part("m1", PartWrite("body", None, _chunks("invoice one", "INV-2024 two"), {0: _vec_blob(0.1), 1: _vec_blob(0.2)}))
+    tmp_store.upsert_file(_rec(os.path.join(root, "a.eml"), message_key="m1", parse_status="indexed"))
+    tmp_store.upsert_file(_rec(os.path.join(root, "b.eml"), parse_status="failed", status_reason="ParseError: x"))
+    tmp_store.upsert_file(_rec(os.path.join(root, "gone.eml"), parse_status="indexed"))
+    tmp_store.tombstone([os.path.join(root, "gone.eml")], 10)
+
+    tmp_store.clear_index()
+
+    assert tmp_store.counts()["chunks"] == 0
+    assert _vec_ids(tmp_store) == set()
+    assert not tmp_store.conn.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'invoice'").fetchall()
+    assert not tmp_store.conn.execute("SELECT rowid FROM chunks_trigram WHERE chunks_trigram MATCH '\"INV-2024\"'").fetchall()
+    assert tmp_store.get_file(os.path.join(root, "a.eml")).parse_status == "pending"
+    assert tmp_store.get_file(os.path.join(root, "b.eml")).parse_status == "pending"
+    assert tmp_store.get_file(os.path.join(root, "gone.eml")).parse_status == "indexed"  # tombstoned rows stay
+
+
+def test_pending_file_count_counts_live_pending_rows(tmp_store, corpus_dir):
+    root = str(corpus_dir)
+    assert tmp_store.pending_file_count() == 0
+    for name, status in (("p1.eml", "pending"), ("p2.eml", "pending"), ("gone.eml", "pending"), ("ok.eml", "indexed")):
+        tmp_store.upsert_file(_rec(os.path.join(root, name), parse_status=status))
+    tmp_store.tombstone([os.path.join(root, "gone.eml")], 10)
+    assert tmp_store.pending_file_count() == 2

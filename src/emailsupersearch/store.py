@@ -565,6 +565,51 @@ class ProjectStore:
             )
             return [r["part"] for r in rows]
 
+    # ---- supervisor upkeep ----
+
+    def retry_failed_files(self, prefixes: tuple[str, ...]) -> int:
+        """Send ``failed`` rows whose reason starts with one of ``prefixes`` back to ``pending``; returns how many.
+
+        The next reconcile then parses them again. The prefixes are compared as plain text (``_`` is no wildcard).
+        """
+        if not prefixes:
+            return 0
+        condition = " OR ".join("substr(status_reason, 1, length(?)) = ?" for _ in prefixes)
+        params = [text for prefix in prefixes for text in (prefix, prefix)]
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE files SET parse_status = 'pending', status_reason = ''"
+                f" WHERE parse_status = 'failed' AND ({condition})",
+                params,
+            )
+        return cur.rowcount
+
+    def orphan_message_keys(self) -> list[str]:
+        """Keys of stored messages that no ``files`` row links to, live or tombstoned, sorted."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT message_key FROM messages m"
+                " WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.message_key = m.message_key) ORDER BY message_key"
+            )
+            return [r["message_key"] for r in rows]
+
+    def clear_index(self) -> None:
+        """Empty the index for a full rebuild, in one transaction: every chunk goes (the triggers clear both keyword
+        tables), every vector goes, and every live file row goes back to ``pending`` so the next reconcile re-parses
+        it, from the parse cache when it has the file. Messages, attachments and chains stay until then."""
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM chunks")
+            self.conn.execute("DELETE FROM chunks_vec")
+            self.conn.execute("UPDATE files SET parse_status = 'pending' WHERE tombstoned_at IS NULL")
+
+    def pending_file_count(self) -> int:
+        """The number of live file rows still waiting to be parsed."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM files WHERE tombstoned_at IS NULL AND parse_status = 'pending'"
+            ).fetchone()
+        return int(row[0])
+
     # ---- counts ----
 
     def counts(self) -> dict[str, int]:
