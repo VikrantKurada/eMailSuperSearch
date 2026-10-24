@@ -16,7 +16,7 @@ import numpy as np
 
 from emailsupersearch.db.connection import connect
 from emailsupersearch.db.schema import migrate
-from emailsupersearch.diagnostics.corpus import generate
+from emailsupersearch.diagnostics.corpus import generate, write_text_png
 from emailsupersearch.index.embedder import (
     OnnxEmbedder,
     load_default_embedder,
@@ -36,6 +36,8 @@ PAD_BATCH = 10_000
 MB = 1024 * 1024
 NO_MODELS_NOTE = "embedder: models package not installed; semantic search disabled"
 NO_OCR_NOTE = "ocr: engine module not available in this build"
+NO_OCR_ENGINE_NOTE = "ocr: no OCR engine available"
+OCR_BENCH_PAGES = 5
 
 
 @dataclass
@@ -96,12 +98,32 @@ def _embedding_chunker(embedder: OnnxEmbedder | None) -> Chunker:
 
 
 def _ocr_pages_per_s(notes: list[str]) -> float | None:
-    """Pages per second through the OCR engine; Task 20 times the corpus PNGs after this import succeeds."""
+    """Pages per second through the English OCR engine over `OCR_BENCH_PAGES` rendered text images.
+
+    None, with a note, when no engine can run or the engine fails; the note never holds recognised text.
+    """
     try:
-        from emailsupersearch.ingest.ocr.base import select_engine  # noqa: F401
+        from emailsupersearch.ingest.ocr.base import select_engine
     except ImportError:
         notes.append(NO_OCR_NOTE)
-    return None
+        return None
+    engine = select_engine("en")
+    if engine is None:
+        notes.append(NO_OCR_ENGINE_NOTE)
+        return None
+    pages = [
+        write_text_png(f"bench page {i} the quarterly invoice for the office lease is attached for review")
+        for i in range(OCR_BENCH_PAGES)
+    ]
+    try:
+        started = time.perf_counter()
+        for png in pages:
+            engine.recognize(png)
+        elapsed = time.perf_counter() - started
+    except Exception as e:  # noqa: BLE001 - the bench reports a failing engine instead of failing
+        notes.append(f"ocr: the {engine.name} engine failed ({type(e).__name__})")
+        return None
+    return len(pages) / elapsed
 
 
 def _random_unit_vectors(rng: np.random.Generator, count: int, dim: int) -> np.ndarray:

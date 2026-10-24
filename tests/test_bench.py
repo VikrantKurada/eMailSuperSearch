@@ -4,7 +4,11 @@ import logging
 import pytest
 
 from emailsupersearch.cli import main
-from emailsupersearch.diagnostics.bench import NO_MODELS_NOTE, run_bench
+from emailsupersearch.diagnostics.bench import (
+    NO_MODELS_NOTE,
+    NO_OCR_ENGINE_NOTE,
+    run_bench,
+)
 
 
 def test_run_bench_without_models_has_notes(monkeypatch):
@@ -36,3 +40,10 @@ def test_run_bench_counts_unparsable_files_without_logging_their_names(tmp_path,
         r = run_bench(tmp_path, vectors=10)
     assert r.n_files == 0 and "parse: 1 of 1 files did not parse and are not counted" in r.notes
     assert "secret-name" not in caplog.text and str(tmp_path) not in caplog.text
+
+
+def test_bench_notes_when_no_engine(monkeypatch):
+    monkeypatch.setattr("emailsupersearch.diagnostics.bench.load_default_embedder", lambda threads=4: None)
+    monkeypatch.setattr("emailsupersearch.ingest.ocr.base.select_engine", lambda language: None)
+    r = run_bench(None, n_threads=1, vectors=10)
+    assert r.ocr_pages_per_s is None and NO_OCR_ENGINE_NOTE in r.notes

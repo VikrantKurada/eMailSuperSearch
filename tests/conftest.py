@@ -50,6 +50,18 @@ def chunker_ws():
 
 
 @pytest.fixture
+def conn(tmp_path):
+    """A migrated, empty project database at ``tmp_path / "q.sqlite"``; closed at teardown."""
+    from emailsupersearch.db.connection import connect
+    from emailsupersearch.db.schema import migrate
+
+    c = connect(tmp_path / "q.sqlite")
+    migrate(c)
+    yield c
+    c.close()
+
+
+@pytest.fixture
 def parsed_factory():
     """Build a ParsedMessage with sensible defaults; keyword overrides replace any field."""
     from emailsupersearch.types import ParsedMessage, Recipient

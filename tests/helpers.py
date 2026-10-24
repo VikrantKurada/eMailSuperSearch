@@ -6,6 +6,7 @@ import io
 import random
 import time
 from collections.abc import Callable, Sequence
+from email.message import EmailMessage
 from typing import Any
 
 import openpyxl
@@ -34,6 +35,7 @@ __all__ = [
     "blank_pdf_bytes",
     "encrypted_pdf_bytes",
     "make_eml_bytes",
+    "make_eml_with_png_bytes",
     "noisy_png",
     "wait_until",
     "write_minimal_pdf",
@@ -135,6 +137,18 @@ def att_pptx(text: str) -> ParsedAttachment:
 
 def att_png(data: bytes) -> ParsedAttachment:
     return _attachment("image.png", "image/png", "image", data)
+
+
+def make_eml_with_png_bytes(text: str) -> bytes:
+    """A message with a plain-text body and ``text`` rendered as ``scan.png`` (``image/png``, no Content-ID)."""
+    msg = EmailMessage()
+    msg["Subject"] = "scanned page"
+    msg["From"] = "sender@example.com"
+    msg["To"] = "recipient@example.org"
+    msg["Message-ID"] = "<scan-1@example.com>"
+    msg.set_content("The scanned page is attached.")
+    msg.add_attachment(write_text_png(text), maintype="image", subtype="png", filename="scan.png")
+    return msg.as_bytes()
 
 
 def blank_pdf_bytes(pages: int) -> bytes:
