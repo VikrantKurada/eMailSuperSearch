@@ -118,6 +118,11 @@ class ProjectStore:
             raise
         return cls(path, conn)
 
+    @property
+    def lock(self) -> threading.RLock:
+        """The writer lock. Collaborators that read or write through ``conn`` hold it, as the store's own methods do."""
+        return self._lock
+
     def close(self) -> None:
         """Close every connection so the database file can be deleted on Windows. Safe to call twice."""
         with self._lock:

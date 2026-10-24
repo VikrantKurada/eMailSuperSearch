@@ -25,6 +25,8 @@ CREATE TABLE jobs (id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, state TEXT, 
 CREATE INDEX idx_messages_sent_ts ON messages (sent_ts);
 CREATE INDEX idx_messages_sender_addr ON messages (sender_addr);
 CREATE INDEX idx_messages_chain_id ON messages (chain_id);
+CREATE INDEX idx_messages_message_id ON messages (message_id);
+CREATE INDEX idx_messages_normalized_subject ON messages (normalized_subject);
 CREATE INDEX idx_recipients_addr ON recipients (addr);
 CREATE INDEX idx_recipients_message_key ON recipients (message_key);
 CREATE INDEX idx_chunks_message_key ON chunks (message_key);
