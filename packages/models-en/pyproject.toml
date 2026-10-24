@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emailsupersearch-models-en"
+version = "0.1.0"
+description = "English embedding model (int8 ONNX all-MiniLM-L6-v2) for emailsupersearch."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emailsupersearch_models_en"]
+artifacts = ["src/emailsupersearch_models_en/data/**"]
