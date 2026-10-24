@@ -128,3 +128,22 @@ def tmp_store(tmp_path, corpus_dir):
     store.add_folder(str(corpus_dir), "local")
     yield store
     store.close()
+
+
+@pytest.fixture
+def store_with_chunks(tmp_store):
+    """``tmp_store`` holding one message's five chunks: the first three mention "renewal", the fourth an invoice number."""
+    from types import SimpleNamespace
+
+    from emailsupersearch.ingest.chunker import ChunkText
+
+    texts = [
+        "Please confirm the renewal date before the end of the month.",
+        "The annual renewal terms were agreed by both parties last week.",
+        "Pricing for the renewal is unchanged from the previous contract.",
+        "Invoice INV-2024-00017 is attached",
+        "Lunch on Friday works for everyone on the team.",
+    ]
+    chunks = [ChunkText(idx, text, len(text.split())) for idx, text in enumerate(texts)]
+    rowids = tmp_store.replace_chunks("m-fts", "body", chunks)
+    return SimpleNamespace(store=tmp_store, conn=tmp_store.conn, rowids=rowids, invoice_rowid=rowids[3])
