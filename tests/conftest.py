@@ -188,6 +188,28 @@ def _make_pipeline(store, cache_dir, chunker, embedder, pool, enqueue_ocr):
     return IngestPipeline(store, ParseCache(cache_dir), pool, chunker, embedder, vectors, enqueue_ocr=enqueue_ocr)
 
 
+@pytest.fixture(scope="session")
+def indexed_store(tmp_path_factory, chunker, embedder_or_none, parse_pool):
+    """A ProjectStore holding the fully ingested 12-thread corpus (seed 5), shared by the whole session.
+
+    It embeds when the models are installed. Tests that change it restore what they changed; it is closed at
+    session end.
+    """
+    from emailsupersearch.diagnostics.corpus import generate
+    from emailsupersearch.ingest.scan import reconcile
+    from emailsupersearch.store import ProjectStore
+
+    root = tmp_path_factory.mktemp("indexed")
+    corpus = root / "corpus"
+    generate(corpus, 12, seed=5)
+    store = ProjectStore.open(root / "proj")
+    store.add_folder(str(corpus), "local")
+    pipeline = _make_pipeline(store, root / "cache", chunker, embedder_or_none, parse_pool, None)
+    pipeline.apply_scan(reconcile(store, [corpus], 1, now=1))
+    yield store
+    store.close()
+
+
 @pytest.fixture
 def pipeline(tmp_store, tmp_path, chunker, embedder_or_none, parse_pool):
     """An ingest pipeline over ``tmp_store`` with no OCR engine; it embeds when the models are installed."""

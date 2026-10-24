@@ -102,3 +102,9 @@ def messages_by_date(conn: sqlite3.Connection, f: SearchFilters, limit: int, off
     where, params = _where(f)
     sql = _SELECT_KEYS + where + _NEWEST_FIRST + " LIMIT ? OFFSET ?"
     return [row[0] for row in conn.execute(sql, [*params, limit, offset])]
+
+
+def count_messages(conn: sqlite3.Connection, f: SearchFilters) -> int:
+    """How many live messages pass the filters: the total behind the pages of ``messages_by_date``."""
+    where, params = _where(f)
+    return int(conn.execute("SELECT COUNT(*) FROM messages m WHERE " + where, params).fetchone()[0])

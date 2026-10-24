@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import random
+import re
 import time
 from collections.abc import Callable, Sequence
 from email.message import EmailMessage
@@ -37,6 +38,7 @@ __all__ = [
     "make_eml_bytes",
     "make_eml_with_png_bytes",
     "noisy_png",
+    "paraphrase",
     "wait_until",
     "write_minimal_pdf",
     "write_text_png",
@@ -149,6 +151,28 @@ def make_eml_with_png_bytes(text: str) -> bytes:
     msg.set_content("The scanned page is attached.")
     msg.add_attachment(write_text_png(text), maintype="image", subtype="png", filename="scan.png")
     return msg.as_bytes()
+
+
+# Content words a paraphrase may swap; "joins" and "needs" give TOPICS[4] (the laptop request) something to change.
+_SYNONYMS = {
+    "budget": "spending plan", "renewal": "extension", "meeting": "call", "invoice": "bill",
+    "vendor": "supplier", "deadline": "due date", "contract": "agreement", "report": "summary",
+    "review": "assessment", "approval": "sign-off", "joins": "is joining", "needs": "requires",
+}
+
+
+def paraphrase(body: str) -> str:
+    """The first sentence of ``body`` with up to two of its words swapped for synonyms from ``_SYNONYMS``."""
+    words = re.split(r"(?<=[.!?])\s+", body.strip(), maxsplit=1)[0].split(" ")
+    swapped = 0
+    for i, word in enumerate(words):
+        core = word.strip(".,;:!?")
+        synonym = _SYNONYMS.get(core.lower())
+        if synonym is None or swapped == 2:
+            continue
+        words[i] = word.replace(core, synonym.capitalize() if core[:1].isupper() else synonym)
+        swapped += 1
+    return " ".join(words)
 
 
 def blank_pdf_bytes(pages: int) -> bytes:
