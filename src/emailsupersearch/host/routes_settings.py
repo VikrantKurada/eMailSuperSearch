@@ -5,8 +5,9 @@
 - ``PUT /api/settings`` with any of ``port`` (an integer from 1024 to 65535), ``log_level`` (``DEBUG``, ``INFO``,
   ``WARNING`` or ``ERROR``) and ``data_root`` (a folder ``validate_data_root`` accepts; refused with its reason
   otherwise): stores them in the catalog and answers the GET body plus ``restart_required``, true when the port or
-  the data root changed. Both take effect at the next start; this host keeps its port and its data root. Other
-  keys, such as the GET body's read-only ones, are ignored.
+  the data root changed. Both take effect at the next start; this host keeps its port and its data root. A new
+  ``data_root`` is also stored in the default root's catalog (``paths.data_root()``, which is marked as this
+  program's), where the launcher looks for it. Other keys, such as the GET body's read-only ones, are ignored.
 - ``GET /api/projects/{id}/settings``: ``reconcile_interval_s``, ``ocr_enabled``, ``ocr_engine_order``,
   ``export_dir`` and ``group_by_chain_default``, from the project's store.
 - ``PUT /api/projects/{id}/settings`` with any of those: ``reconcile_interval_s`` an integer from 60 to 86400,
@@ -30,7 +31,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from emailsupersearch import __version__
+from emailsupersearch import __version__, paths
+from emailsupersearch.catalog import Catalog
 from emailsupersearch.host.routes_projects import (
     ApiError,
     read_json,
@@ -114,9 +116,25 @@ def put_settings(request: Request) -> JSONResponse:
         "data_root" in updates
         and Path(updates["data_root"]) != Path(catalog.get_setting("data_root", str(catalog.root)))
     )
+    if "data_root" in updates:
+        _store_in_default_catalog(catalog, updates["data_root"])
     for key, value in updates.items():
         catalog.set_setting(key, value)
     return JSONResponse({**_global_settings(services), "restart_required": restart_required})
+
+
+def _store_in_default_catalog(running: Catalog, data_root: str) -> None:
+    """Store ``data_root`` in the default root's catalog too, where the launcher reads it at the next start, unless
+    this host runs from the default root (then ``running`` is that catalog)."""
+    default = paths.data_root()
+    if os.path.normcase(os.path.abspath(default)) == os.path.normcase(os.path.abspath(running.root)):
+        return
+    catalog = Catalog(default)  # creates the default root's layout when it is new
+    try:
+        catalog.set_setting("data_root", data_root)
+    finally:
+        catalog.close()
+    paths.mark_root(default)
 
 
 # ---- project settings ----

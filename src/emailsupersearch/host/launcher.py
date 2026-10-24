@@ -1,31 +1,40 @@
 """The host launcher: ``serve`` runs the always-on host for a data root, ``stop`` asks it to shut down.
 
-``serve`` refuses a data root that ``validate_data_root`` rejects (exit 2). When a host already serves the root it
-only opens the browser on it. Otherwise it takes the single-instance lock, records a doctor run, builds the services,
-starts a supervisor for every project and serves the app with uvicorn, bound to 127.0.0.1 only and with uvicorn's
-own logging off. The ``/auth`` URL carries the launch token: it is opened in the browser and, with a console, printed
-once, but never logged. On exit the host stops its supervisors, closes the catalog, removes its run files, releases
-the lock and, when the UI asked for a purge, removes the data root.
+``serve`` refuses a data root that ``validate_data_root`` rejects, and a folder that already holds files without the
+ownership marker (exit 2); a root it takes on gets the marker. When a host already serves the root it only opens the
+browser on it. Otherwise it takes the single-instance lock, records a doctor run, builds the services, starts a
+supervisor for every project and serves the app with uvicorn, bound to 127.0.0.1 only and with uvicorn's own logging
+off. The ``/auth`` URL carries the launch token: it is opened in the browser and, on a console, printed once, but
+never written where a log is (so not at all when the std streams go to ``logs/host-stderr.log``). On exit, Ctrl+C
+and Ctrl+Break included, the host stops its supervisors, closes the catalog, removes its run files, releases the
+lock and, when the UI asked for a purge, removes the data root.
+
+A purge removes only what this program keeps in a marked root, and folders only once they are empty: see
+``remove_root``.
 
 Native libraries (onnxruntime, tokenizers, numpy) are imported only by ``serve``, so ``stop`` and ``purge`` still
-work on a machine where one of them is blocked.
+work on a machine where one of them is blocked; they read the catalog through a read-only ``sqlite3`` connection.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
+import re
 import shutil
+import signal
 import socket
 import sqlite3
 import sys
+import threading
 import time
 import urllib.request
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 
@@ -40,6 +49,8 @@ from emailsupersearch.host.lock import (
     acquire,
     clear,
     host_exited,
+    lock_held,
+    process_created,
     read_running,
     read_token,
     write_running,
@@ -47,8 +58,15 @@ from emailsupersearch.host.lock import (
 )
 from emailsupersearch.host.security import LAUNCH_HEADER, SessionStore, new_token
 from emailsupersearch.host.sse import EventBus
-from emailsupersearch.logging_setup import LOGGER_NAME, configure_logging
-from emailsupersearch.paths import data_root, ensure_layout, validate_data_root
+from emailsupersearch.logging_setup import close_logging, configure_logging
+from emailsupersearch.paths import (
+    MARKER_FILE,
+    data_root,
+    ensure_layout,
+    is_marked,
+    mark_root,
+    validate_data_root,
+)
 
 if TYPE_CHECKING:
     from emailsupersearch.catalog import Catalog
@@ -61,27 +79,17 @@ log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 GRACEFUL_SHUTDOWN_S = 5  # an open event stream is cut off after this long, so a stop never stalls on one
-STOP_WAIT_S = 10.0
+STOP_WAIT_S = 10.0  # how long stop waits for a starting host to serve, and then for a host to finish
 STDERR_LOG = "host-stderr.log"
 
 _STOP_POLL_S = 0.2
 _SHUTDOWN_REQUEST_TIMEOUT_S = 5
 _PURGE_RETRIES = 5  # after the first attempt: six tries in all, 0.2 s apart
 _PURGE_RETRY_S = 0.2
-# Everything this program keeps in a data root. A purge removes these and then the root, if nothing else is left.
-_ROOT_ENTRIES = (
-    "projects",
-    "cache",
-    "models",
-    "logs",
-    "catalog.sqlite",
-    "catalog.sqlite-wal",
-    "catalog.sqlite-shm",
-    "catalog.sqlite-journal",
-    LOCK_FILE,
-    RUNNING_FILE,
-    TOKEN_FILE,
-)
+_CATALOG_FILES = ("catalog.sqlite", "catalog.sqlite-wal", "catalog.sqlite-shm")
+_RUN_FILES = (LOCK_FILE, RUNNING_FILE, TOKEN_FILE)
+_FOLDERS = ("projects", "cache", "logs", "models")  # a purge removes these only once they are empty
+_PROJECT_ID = re.compile(r"[A-Za-z0-9_-]+")  # anything else from the catalog is never joined onto a path
 # Loopback requests must never go through a proxy configured for the machine.
 _LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -109,37 +117,85 @@ def resolve_root() -> Path:
 
 def _stored_data_root(default: Path) -> str | None:
     """The ``data_root`` setting of the default root's catalog, or None when there is no catalog or no setting."""
-    if not (default / "catalog.sqlite").is_file():  # never create the default root just to read a setting
-        return None
-    from emailsupersearch.catalog import Catalog
-
-    try:
-        catalog = Catalog(default)
-    except sqlite3.Error as e:
-        log.warning("the default catalog could not be read: %s", type(e).__name__)
+    rows = _read_catalog(default, "SELECT value FROM settings WHERE key = ?", ("data_root",))
+    if not rows:
         return None
     try:
-        value = catalog.get_setting("data_root")
-    finally:
-        catalog.close()
+        value = json.loads(rows[0][0])
+    except (TypeError, ValueError):
+        return None
     return value if isinstance(value, str) and value.strip() else None
 
 
-def remove_root(root: Path) -> str | None:
-    """Remove the data root: everything this program keeps there, then the folder itself if nothing else is left.
+def _read_catalog(root: Path, sql: str, params: tuple[Any, ...] = ()) -> list[tuple]:
+    """Rows from ``root``'s catalog through a read-only connection; none when the file or the table is missing.
 
-    Files the owner put in the folder are left alone. A failed removal is retried five times, 0.2 s apart, because
-    Windows releases closed files late. Returns None once the root is gone, else why it is not.
+    Read-only, and without the ``Catalog`` class: nothing is created, and no native library is loaded.
     """
+    path = root / "catalog.sqlite"
+    if not path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log.info("the catalog could not be read: %s", type(e).__name__)
+        return []
+
+
+def _not_ours(root: Path) -> str | None:
+    """Why ``serve`` must not take ``root`` on: it is a file, or a folder that holds files but no marker."""
+    if not root.exists() or is_marked(root):
+        return None
+    if not root.is_dir():
+        return "the data root is a file, not a folder"
+    try:
+        empty = next(root.iterdir(), None) is None
+    except OSError:
+        return "the data root folder cannot be read"
+    if empty:
+        return None
+    return (
+        "the data root folder already holds files but no eMailSuperSearch marker, so it is not a data root this"
+        " program made; choose a new or empty folder"
+    )
+
+
+def remove_root(root: Path) -> str | None:
+    """Remove a data root this program made, as far as it is the program's. Returns None once the root is gone,
+    else why it is not.
+
+    Refused, touching nothing, when the root has no ownership marker. Removed: the project folders the catalog
+    lists, the catalog files, ``cache/parsed``, ``logs/host*.log*``, the run files and the marker (last); then
+    ``projects``, ``cache``, ``logs``, ``models`` and the root itself, each only once empty, so anything else in
+    them stays. A junction or symbolic link is removed itself, never followed. A failed removal is retried five
+    times, 0.2 s apart, because Windows releases closed files late.
+    """
+    if not root.exists():
+        return None
+    if not is_marked(root):
+        return "the folder carries no eMailSuperSearch marker, so nothing in it was removed"
+    project_ids = [
+        row[0]
+        for row in _read_catalog(root, "SELECT id FROM projects")
+        if isinstance(row[0], str) and _PROJECT_ID.fullmatch(row[0])
+    ]
     for attempt in range(_PURGE_RETRIES + 1):
         try:
-            _remove_entries(root)
+            _remove_owned(root, project_ids)
             break
         except OSError:
             if attempt == _PURGE_RETRIES:
                 return "the data root could not be removed completely: a file in it is still in use"
             time.sleep(_PURGE_RETRY_S)
-    if _holds_other_files(root):
+    _remove(root / MARKER_FILE)
+    for name in _FOLDERS:
+        with contextlib.suppress(OSError):  # not empty: it holds something this program did not put there
+            (root / name).rmdir()
+    if next(root.iterdir(), None) is not None:
         return "the data root holds files this program did not create; they were left in place"
     try:
         root.rmdir()
@@ -150,21 +206,46 @@ def remove_root(root: Path) -> str | None:
     return None
 
 
-def _remove_entries(root: Path) -> None:
-    for name in _ROOT_ENTRIES:
+def _remove_owned(root: Path, project_ids: list[str]) -> None:
+    """Remove the program's own entries in ``root`` (see ``remove_root``); a folder that is a link goes as a link."""
+    projects, cache, logs, models = (root / name for name in _FOLDERS)
+    if _is_link(projects):
+        _remove(projects)
+    elif projects.is_dir():
+        for project_id in project_ids:
+            _remove(projects / project_id)
+    if _is_link(cache):
+        _remove(cache)
+    elif cache.is_dir():
+        _remove(cache / "parsed")
+    if _is_link(logs):
+        _remove(logs)
+    elif logs.is_dir():
+        for path in logs.glob("host*.log*"):
+            if _is_link(path) or path.is_file():
+                _remove(path)
+    if _is_link(models):
+        _remove(models)
+    for name in (*_CATALOG_FILES, *_RUN_FILES):
         path = root / name
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+        if _is_link(path) or path.is_file():
+            _remove(path)
 
 
-def _holds_other_files(root: Path) -> bool:
-    try:
-        return any(entry.name not in _ROOT_ENTRIES for entry in root.iterdir())
-    except OSError:
-        return False
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _remove(path: Path) -> None:
+    """Remove a file or a folder tree; a link is removed itself (``rmtree`` does not follow the links inside a tree
+    either). A missing path is fine."""
+    if _is_link(path):
+        os.unlink(path)  # on Windows this removes a directory junction or symlink, never its target
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
 
 
 # ---- console and std streams ----
@@ -231,14 +312,15 @@ def _auth_url(port: int, token: str | None) -> str:
 def serve(root: Path, port: int | None, headless: bool, open_browser: bool = True) -> int:
     """Run the host for ``root`` until it is stopped, or open the browser on the host already running; see the
     module docstring. Exit codes: 0 done, 1 another instance is starting, 2 the data root is refused."""
-    reason = validate_data_root(root)
+    reason = validate_data_root(root) or _not_ours(root)
     if reason is not None:
         _say(reason, err=True)
         return 2
-    redirected = headless or sys.stdout is None
+    redirected = headless or sys.stdout is None  # then stdout is a log file: the URL is never printed
     if redirected:
         redirect_std_streams_to_log(root)
     ensure_layout(root)
+    mark_root(root)
     from emailsupersearch.catalog import Catalog
 
     catalog = Catalog(root)
@@ -255,13 +337,13 @@ def serve(root: Path, port: int | None, headless: bool, open_browser: bool = Tru
         url = _auth_url(running.port, read_token(root))
         if open_browser:
             webbrowser.open_new_tab(url)
-        elif not headless:
+        elif not redirected:
             _say(url)
         return 0
     if lock is None:
         _say("another instance is starting", err=True)
         return 1
-    _run_host(root, catalog, lock, port, headless, open_browser, redirected)
+    _run_host(root, catalog, lock, port, open_browser, redirected)
     return 0
 
 
@@ -278,22 +360,40 @@ class _ShutdownSwitch:
 
 
 def _run_host(
-    root: Path,
-    catalog: Catalog,
-    lock: InstanceLock,
-    port: int | None,
-    headless: bool,
-    open_browser: bool,
-    redirected: bool,
+    root: Path, catalog: Catalog, lock: InstanceLock, port: int | None, open_browser: bool, redirected: bool
 ) -> None:
     switch = _ShutdownSwitch()
     services: Services | None = None
+    with _break_raises_keyboard_interrupt():
+        try:
+            services = _build_services(root, catalog, switch)
+            _start_supervisors(services)
+            _serve_http(root, services, switch, port, open_browser, redirected)
+        except KeyboardInterrupt:  # Ctrl+C or Ctrl+Break during start-up, or re-raised by uvicorn after its shutdown
+            log.info("the host was interrupted")
+        finally:
+            _shut_down(root, catalog, lock, services, redirected)
+
+
+def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def _break_raises_keyboard_interrupt() -> Iterator[None]:
+    """On Windows, make SIGBREAK (Ctrl+Break, or closing the console) raise ``KeyboardInterrupt`` as Ctrl+C does.
+
+    uvicorn re-raises a signal it caught into the handler it found once it has shut down; with the default SIGBREAK
+    handler that would end the process before the cleanup ran. Handlers can only be set on the main thread.
+    """
+    if sys.platform != "win32" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGBREAK, _raise_keyboard_interrupt)
     try:
-        services = _build_services(root, catalog, switch)
-        _start_supervisors(services)
-        _serve_http(root, services, switch, port, headless, open_browser)
+        yield
     finally:
-        _shut_down(root, catalog, lock, services, redirected)
+        signal.signal(signal.SIGBREAK, previous)
 
 
 def make_start_supervisor(
@@ -353,7 +453,8 @@ def _build_services(root: Path, catalog: Catalog, switch: _ShutdownSwitch) -> Se
 
 
 def _start_supervisors(services: Services) -> None:
-    """Start a supervisor for every project; one that cannot be built is recorded in ``blocked_projects``."""
+    """Start a supervisor for every project; one that cannot be built or started is recorded in
+    ``blocked_projects``, with its store closed again."""
     from emailsupersearch.db.schema import SchemaTooNew
 
     for project in services.catalog.list_projects():
@@ -368,8 +469,16 @@ def _start_supervisors(services: Services) -> None:
             log.debug("opening the project failed", exc_info=True)
             services.blocked_projects[project.id] = type(e).__name__
             continue
+        try:
+            sup.start()
+        except Exception as e:
+            log.warning("project %s could not be started: %s", project.id, type(e).__name__)
+            log.debug("starting the supervisor failed", exc_info=True)
+            services.blocked_projects[project.id] = type(e).__name__
+            with contextlib.suppress(Exception):
+                sup.stop()  # closes its store, so the blocked project can still be deleted
+            continue
         services.supervisors[project.id] = sup
-        sup.start()
 
 
 def _serve_http(
@@ -377,10 +486,11 @@ def _serve_http(
     services: Services,
     switch: _ShutdownSwitch,
     port: int | None,
-    headless: bool,
     open_browser: bool,
+    redirected: bool,
 ) -> None:
-    """Serve the app on 127.0.0.1 until the server is asked to exit (``/api/shutdown``, a purge, or Ctrl+C)."""
+    """Serve the app on 127.0.0.1 until the server is asked to exit (``/api/shutdown``, a purge, Ctrl+C or
+    Ctrl+Break)."""
     from emailsupersearch.host.app import create_app
 
     chosen = choose_port(port or int(services.catalog.get_setting("port", DEFAULT_PORT)))
@@ -395,18 +505,16 @@ def _serve_http(
     )
     server = uvicorn.Server(config)
     switch.server = server
-    write_running(root, RunningInfo(os.getpid(), chosen))
+    write_running(root, RunningInfo(os.getpid(), chosen, process_created(os.getpid())))
     url = _auth_url(chosen, services.launch_token)
     if open_browser:
         webbrowser.open_new_tab(url)
-    if not headless:
+    if not redirected:
         _say(url)
     log.info("the host is serving on port %d", chosen)
-    try:
-        # On the main thread uvicorn handles Ctrl+C itself; on any other thread should_exit is the only way out.
-        server.run()
-    except KeyboardInterrupt:  # uvicorn re-raises the Ctrl+C it caught once it has shut down
-        pass
+    # On the main thread uvicorn handles Ctrl+C and Ctrl+Break itself; on any other thread should_exit is the only
+    # way out.
+    server.run()
 
 
 def _shut_down(
@@ -432,12 +540,9 @@ def _shut_down(
 
 
 def _purge_on_exit(root: Path, redirected: bool) -> None:
-    """Close every handler of the package logger and detach the std streams from the log folder (the files live in
-    the root and Windows will not delete an open file), then remove the root."""
-    logger = logging.getLogger(LOGGER_NAME)
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
+    """Close the package logger's files and detach the std streams from the log folder (the files live in the root
+    and Windows will not delete an open file), then remove the root."""
+    close_logging()
     if redirected:
         _detach_std_streams()
     problem = remove_root(root)
@@ -449,12 +554,37 @@ def _purge_on_exit(root: Path, redirected: bool) -> None:
 
 
 def stop(root: Path) -> int:
-    """Ask the host serving ``root`` to shut down and wait up to 10 s for it to finish: 0 when it has (or none was
-    running), 1 when it is still running."""
-    running = read_running(root)
-    if running is None:
+    """Ask the host serving ``root`` to shut down and wait for it to finish: 0 when it has (or none was running),
+    1 when it is still running or still starting. A host holding the lock without having written ``host.json`` is
+    starting: ``stop`` waits up to 10 s for it to serve first."""
+    code = _stop_host(root)
+    if code is None:
         _say("not running")
         return 0
+    return code
+
+
+def stop_any(roots: Iterable[Path]) -> int:
+    """``stop`` for every root in ``roots`` (each once): 0 only when no host is left running in any of them."""
+    codes = [code for root in dict.fromkeys(roots) if (code := _stop_host(root)) is not None]
+    if not codes:
+        _say("not running")
+        return 0
+    return max(codes)
+
+
+def _stop_host(root: Path) -> int | None:
+    """None when no host runs or starts in ``root``; else 0 once it has finished and 1 when it has not."""
+    running = read_running(root)
+    if running is None:
+        if not lock_held(root):
+            return None
+        running = _await_serving(root)
+        if running is None:
+            if not lock_held(root):  # it gave up starting
+                return None
+            _say("the host is still starting; try again shortly", err=True)
+            return 1
     request = urllib.request.Request(
         f"http://127.0.0.1:{running.port}/api/shutdown",
         method="POST",
@@ -472,3 +602,15 @@ def stop(root: Path) -> int:
             return 1
         time.sleep(_STOP_POLL_S)
     return 0
+
+
+def _await_serving(root: Path) -> RunningInfo | None:
+    """Wait up to ``STOP_WAIT_S`` for a starting host to write ``host.json``; None when it did not, or when it let
+    go of the lock instead."""
+    deadline = time.monotonic() + STOP_WAIT_S
+    while time.monotonic() < deadline:
+        time.sleep(_STOP_POLL_S)
+        running = read_running(root)
+        if running is not None or not lock_held(root):
+            return running
+    return None

@@ -1,6 +1,10 @@
 """The global and project settings routes and the purge request, driven through the real app."""
 
+import pytest
+
 from emailsupersearch import __version__
+from emailsupersearch.catalog import Catalog
+from emailsupersearch.paths import is_marked
 
 _DEFAULT_PROJECT_SETTINGS = {
     "reconcile_interval_s": 900,
@@ -9,6 +13,13 @@ _DEFAULT_PROJECT_SETTINGS = {
     "export_dir": None,
     "group_by_chain_default": True,
 }
+
+
+@pytest.fixture(autouse=True)
+def _default_root(monkeypatch, tmp_path):
+    """A ``data_root`` change is written to the default root's catalog too: keep that root inside the test folder."""
+    monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(tmp_path / "default-root"))
+    return tmp_path / "default-root"
 
 
 def test_settings_roundtrip(client, host_services, tmp_path):
@@ -43,6 +54,18 @@ def test_settings_roundtrip(client, host_services, tmp_path):
         r = client.put("/api/settings", json=body)
         assert r.status_code == 400 and r.json()["error"], body
     assert client.get("/api/settings").json() == expected
+
+
+def test_data_root_change_reaches_the_default_catalog(client, host_services, tmp_path, _default_root):
+    new_root = str(tmp_path / "elsewhere")
+    assert client.put("/api/settings", json={"data_root": new_root}).status_code == 200
+    assert host_services.catalog.get_setting("data_root") == new_root
+    default = Catalog(_default_root)  # where the launcher looks for it at the next start
+    try:
+        assert default.get_setting("data_root") == new_root
+    finally:
+        default.close()
+    assert is_marked(_default_root)
 
 
 def test_settings_refuses_onedrive_data_root(client, host_services):

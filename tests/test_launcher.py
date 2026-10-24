@@ -2,7 +2,7 @@
 
 Tests that serve run ``serve`` on a daemon thread of this process and always stop it. Its stream redirection is
 recorded instead of done there (it would ``dup2`` over pytest's own fds 1 and 2); the real one runs in a child
-process, as does the headless purge.
+process, as do the headless purge, the console-less start and Ctrl+Break.
 """
 
 import contextlib
@@ -20,6 +20,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from helpers import wait_until
@@ -30,6 +31,7 @@ from emailsupersearch.host import launcher
 from emailsupersearch.host.launcher import (
     DEFAULT_PORT,
     choose_port,
+    remove_root,
     resolve_root,
     serve,
     stop,
@@ -37,12 +39,14 @@ from emailsupersearch.host.launcher import (
 from emailsupersearch.host.lock import (
     RunningInfo,
     acquire,
+    process_created,
     read_running,
     read_token,
     write_running,
     write_token,
 )
 from emailsupersearch.host.sse import EventBus
+from emailsupersearch.paths import MARKER_FILE, ensure_layout, is_marked, mark_root
 
 _START_S = 60  # serve's start-up runs the doctor and loads the embedder
 _EXIT_S = 10  # serve must have returned this long after stop was called
@@ -54,12 +58,8 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _detach_host_log():
     """Close the log handler serve attaches, so later tests do not write to this test's ``host.log``."""
     yield
-    logger = logging.getLogger(logging_setup.LOGGER_NAME)
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
-    logger.setLevel(logging.NOTSET)
-    logging_setup._HANDLERS.clear()
+    logging_setup.close_logging()
+    logging.getLogger(logging_setup.LOGGER_NAME).setLevel(logging.NOTSET)
 
 
 @pytest.fixture
@@ -68,6 +68,16 @@ def redirects(monkeypatch):
     calls: list[Path] = []
     monkeypatch.setattr(launcher, "redirect_std_streams_to_log", calls.append)
     return calls
+
+
+@pytest.fixture
+def must_refuse(monkeypatch):
+    """Fail, rather than serve forever on the test's own thread, should serve accept the root."""
+
+    def run_host(*args, **kwargs):
+        raise AssertionError("serve accepted the data root")
+
+    monkeypatch.setattr(launcher, "_run_host", run_host)
 
 
 @dataclass
@@ -106,6 +116,32 @@ def running_host(root: Path, headless: bool = True):
             thread.join(_EXIT_S)
 
 
+@contextlib.contextmanager
+def child_host(args: list[str], root: Path, env: dict | None = None, **popen):
+    """A host in a child process (``python <args>``) serving ``root``, once it answers ``/health``; killed on the
+    way out if still running. Yields ``(child, info)``.
+
+    The pid in ``info`` is not ``child.pid``: the venv's python.exe runs the real interpreter as its own child.
+    """
+    child = subprocess.Popen(
+        [sys.executable, *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **popen
+    )
+    host_pid = None
+    try:
+        info = wait_until(lambda: read_running(root) or child.poll() is not None, _START_S)
+        assert child.poll() is None, "the host exited before it was serving"
+        host_pid = info.pid
+        wait_until(lambda: _health(info.port), 10)
+        yield child, info
+    finally:
+        if child.poll() is None:
+            if host_pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(host_pid, signal.SIGTERM)  # TerminateProcess on Windows
+            child.kill()
+            child.wait(timeout=30)
+
+
 def _session_opener(base: str, token: str) -> tuple[urllib.request.OpenerDirector, str]:
     """An opener holding the session cookies from ``/auth``, and the CSRF value to send with each POST."""
     jar = http.cookiejar.CookieJar()
@@ -126,6 +162,21 @@ def _dead_pid() -> int:
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait(timeout=60)
     return child.pid
+
+
+def _owned_root(root: Path, projects: int = 1) -> list[str]:
+    """A data root as ``serve`` initialises it, holding ``projects`` projects; their ids."""
+    ensure_layout(root)
+    mark_root(root)
+    catalog = Catalog(root)
+    try:
+        return [catalog.create_project(f"P{n}", []).id for n in range(projects)]
+    finally:
+        catalog.close()
+
+
+def _tree(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
 
 
 # ---- port, lock and run files ----
@@ -151,7 +202,7 @@ def test_choose_port_falls_back_when_busy():
 def test_lock_is_exclusive_and_stale_detected(tmp_path):
     lock = acquire(tmp_path)
     assert lock is not None and lock.pid == os.getpid()
-    assert (tmp_path / "host.lock").read_text() == str(os.getpid())
+    assert (tmp_path / "host.lock").read_text() == f"{os.getpid()}\n{process_created(os.getpid())}"
     assert acquire(tmp_path) is None  # held by a live process: this one
     lock.release()
     assert not (tmp_path / "host.lock").exists()
@@ -160,15 +211,30 @@ def test_lock_is_exclusive_and_stale_detected(tmp_path):
     for stale in (str(_dead_pid()), "not a pid", ""):
         (tmp_path / "host.lock").write_text(stale)
         replaced = acquire(tmp_path)
-        assert replaced is not None and (tmp_path / "host.lock").read_text() == str(os.getpid()), stale
+        assert replaced is not None and replaced.pid == os.getpid(), stale
         replaced.release()
 
-    write_running(tmp_path, RunningInfo(os.getpid(), 4321))
+    write_running(tmp_path, RunningInfo(os.getpid(), 4321))  # no creation time recorded: liveness alone counts
     assert read_running(tmp_path) == RunningInfo(os.getpid(), 4321)
     write_running(tmp_path, RunningInfo(_dead_pid(), 4321))
     assert read_running(tmp_path) is None
     (tmp_path / "host.json").write_text("{not json")
     assert read_running(tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the creation time is recorded on Windows only")
+def test_reused_pid_is_stale(tmp_path):
+    created = process_created(os.getpid())
+    assert created > 0
+    # This very process, but created at another time: the pid of a dead host, since given to another program.
+    (tmp_path / "host.lock").write_text(f"{os.getpid()}\n{created + 1}")
+    lock = acquire(tmp_path)
+    assert lock is not None and (tmp_path / "host.lock").read_text() == f"{os.getpid()}\n{created}"
+    lock.release()
+    write_running(tmp_path, RunningInfo(os.getpid(), 4321, created + 1))
+    assert read_running(tmp_path) is None
+    write_running(tmp_path, RunningInfo(os.getpid(), 4321, created))
+    assert read_running(tmp_path) == RunningInfo(os.getpid(), 4321, created)
 
 
 def test_token_file_is_user_only(tmp_path):
@@ -187,17 +253,28 @@ def test_token_file_is_user_only(tmp_path):
 # ---- serve and stop ----
 
 
-def test_serve_refuses_onedrive_root(capsys):
+def test_serve_refuses_onedrive_root(capsys, must_refuse):
     assert serve(Path(r"C:\Users\x\OneDrive\ess"), None, True, False) == 2
     assert "OneDrive" in capsys.readouterr().err
     assert not Path(r"C:\Users\x\OneDrive\ess").exists()
+
+
+def test_serve_refuses_nonempty_unmarked_root(tmp_path, redirects, capsys, must_refuse):
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "report.docx").write_text("the owner's own file")
+    assert serve(root, None, True, False) == 2
+    err = capsys.readouterr().err
+    assert "marker" in err and str(tmp_path) not in err
+    assert _tree(root) == ["report.docx"] and redirects == []
 
 
 def test_serve_then_stop_roundtrip(tmp_path, redirects):
     root = tmp_path / "root"
     with running_host(root) as host:
         assert redirects == [root]  # headless: the std streams go to the log
-        assert (root / "host.lock").read_text() == str(os.getpid())
+        assert (root / "host.lock").read_text().split()[0] == str(os.getpid())
+        assert is_marked(root)
         started = time.monotonic()
         assert stop(root) == 0
         host.thread.join(_EXIT_S)
@@ -233,6 +310,29 @@ def test_auth_url_not_in_logs(tmp_path, redirects, capsys):
         assert "/auth?token=" not in text and token not in text, path.name
 
 
+def test_url_not_logged_without_a_console(tmp_path):
+    """Under pythonw there is no stdout: the std streams go to the log, so the URL must not be printed, by the host
+    or by a second launch that finds it running."""
+    root = tmp_path / "root"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from emailsupersearch.host.launcher import serve\n"
+        "sys.stdout = None\n"
+        f"raise SystemExit(serve(Path({str(root)!r}), None, headless=False, open_browser=False))\n"
+    )
+    with child_host(["-c", script], root) as (child, _):
+        second = subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, timeout=120)
+        assert second.returncode == 0  # it found the running host
+        token = read_token(root)
+        assert stop(root) == 0
+        assert child.wait(timeout=30) == 0
+    assert (root / "logs" / "host-stderr.log").is_file()
+    for path in (p for p in (root / "logs").rglob("*") if p.is_file()):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert "/auth?token=" not in text and token not in text, path.name
+
+
 def test_redirect_std_streams_writes_to_log(tmp_path):
     script = (
         "import os, sys\n"
@@ -249,6 +349,20 @@ def test_redirect_std_streams_writes_to_log(tmp_path):
     assert done.stdout == b"" and done.stderr == b""  # nothing reached the original streams
     text = (tmp_path / "logs" / "host-stderr.log").read_text(encoding="utf-8")
     assert "marker-stdout" in text and "marker-stderr" in text and "marker-fd2" in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console control events")
+def test_ctrl_break_runs_cleanup(tmp_path):
+    root = tmp_path / "root"
+    env = {**os.environ, "EMAILSUPERSEARCH_DATA_ROOT": str(root)}
+    args = ["-m", "emailsupersearch", "serve", "--no-browser"]
+    with child_host(args, root, env, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) as (child, _):
+        try:
+            os.kill(child.pid, signal.CTRL_BREAK_EVENT)  # to the child's process group, the real interpreter included
+        except OSError:
+            pytest.skip("this test process has no console to send Ctrl+Break through")
+        assert child.wait(timeout=30) == 0
+    assert not (root / "host.json").exists() and not (root / "host.lock").exists()
 
 
 def test_stop_with_open_sse_stream_exits_within_10s(tmp_path, redirects):
@@ -286,40 +400,57 @@ def test_stop_with_open_sse_stream_exits_within_10s(tmp_path, redirects):
     assert not (root / "host.json").exists() and not (root / "host.lock").exists()
 
 
+def test_stop_waits_for_a_starting_host(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(launcher, "STOP_WAIT_S", 0.6)
+    lock = acquire(tmp_path)  # a host that holds the lock but has not written host.json yet
+    try:
+        started = time.monotonic()
+        assert stop(tmp_path) == 1
+        assert time.monotonic() - started >= 0.5 and "starting" in capsys.readouterr().err
+        gives_up = threading.Timer(0.2, lock.release)  # it stops starting: nothing is left to stop
+        gives_up.start()
+        assert stop(tmp_path) == 0
+        gives_up.join()
+    finally:
+        lock.release()
+
+
+def test_cli_stop_also_finds_a_host_on_the_default_root(tmp_path, monkeypatch, redirects):
+    monkeypatch.delenv("EMAILSUPERSEARCH_DATA_ROOT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    default = tmp_path / "local" / "eMailSuperSearch"
+    _owned_root(default, projects=0)
+    catalog = Catalog(default)
+    try:
+        catalog.set_setting("data_root", str(tmp_path / "next"))  # takes effect at the next start
+    finally:
+        catalog.close()
+    with running_host(default) as host:
+        assert resolve_root() == tmp_path / "next"
+        assert cli.main(["stop"]) == 0
+        host.thread.join(_EXIT_S)
+        assert not host.thread.is_alive()
+    assert not (default / "host.json").exists()
+
+
 def test_headless_purge_removes_the_data_root(tmp_path):
     """The real command line, headless in a child process: a purge from the UI removes the whole data root,
     the log files its own logger and std streams were writing included."""
     root = tmp_path / "root"
     env = {**os.environ, "EMAILSUPERSEARCH_DATA_ROOT": str(root)}
-    child = subprocess.Popen(
-        [sys.executable, "-m", "emailsupersearch", "serve", "--headless", "--no-browser"],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    host_pid = None
-    try:
-        info = wait_until(lambda: read_running(root) or child.poll() is not None, _START_S)
-        assert child.poll() is None, "the host exited before it was serving"
-        host_pid = info.pid  # not child.pid: the venv's python.exe runs the real interpreter as its child
+    with child_host(["-m", "emailsupersearch", "serve", "--headless", "--no-browser"], root, env) as (child, info):
         base = f"http://127.0.0.1:{info.port}"
-        wait_until(lambda: _health(info.port), 10)
         assert (root / "logs" / "host-stderr.log").is_file() and (root / "logs" / "host.log").is_file()
         opener, csrf = _session_opener(base, read_token(root))
+        with _post_json(opener, f"{base}/api/projects", csrf, {"name": "Mail", "folders": []}) as r:
+            assert r.status == 201
         with _post_json(opener, f"{base}/api/purge", csrf) as r:
             assert r.status == 202
         assert child.wait(timeout=30) == 0
-    finally:
-        if child.poll() is None:
-            if host_pid is not None:
-                with contextlib.suppress(OSError):
-                    os.kill(host_pid, signal.SIGTERM)  # TerminateProcess on Windows
-            child.kill()
-            child.wait(timeout=30)
     assert not root.exists()
 
 
-# ---- root resolution, supervisors, purge command ----
+# ---- root resolution, supervisors, purge ----
 
 
 def test_resolve_root_prefers_env_then_valid_setting(tmp_path, monkeypatch, caplog):
@@ -368,10 +499,33 @@ def test_start_supervisor_closes_store_on_failure(tmp_path, monkeypatch, chunker
         catalog.close()
 
 
+def test_supervisor_that_fails_to_start_blocks_its_project(tmp_path):
+    catalog = Catalog(tmp_path)
+    try:
+        project = catalog.create_project("Unstartable", [])
+        stopped = []
+
+        class Unstartable:
+            def start(self):
+                raise RuntimeError("no thread")
+
+            def stop(self):
+                stopped.append(True)
+
+        services = SimpleNamespace(
+            catalog=catalog, start_supervisor=lambda pid: Unstartable(), supervisors={}, blocked_projects={}
+        )
+        launcher._start_supervisors(services)
+        assert services.supervisors == {} and services.blocked_projects == {project.id: "RuntimeError"}
+        assert stopped == [True]  # its store is closed again
+    finally:
+        catalog.close()
+
+
 def test_purge_requires_yes(tmp_path, monkeypatch, capsys):
     root = tmp_path / "root"
     monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(root))
-    Catalog(root).close()
+    _owned_root(root, projects=2)
     assert cli.main(["purge"]) == 2
     assert "refusing to purge without --yes" in capsys.readouterr().err
     assert (root / "catalog.sqlite").is_file()
@@ -379,11 +533,76 @@ def test_purge_requires_yes(tmp_path, monkeypatch, capsys):
     assert not root.exists()
 
 
+def test_purge_refuses_root_without_marker(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "root"
+    monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(root))
+    _owned_root(root)
+    (root / MARKER_FILE).unlink()
+    before = _tree(root)
+    assert cli.main(["purge", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "marker" in err and str(tmp_path) not in err
+    assert _tree(root) == before
+
+
 def test_purge_keeps_files_it_did_not_create(tmp_path, monkeypatch, capsys):
     root = tmp_path / "root"
     monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(root))
-    Catalog(root).close()
+    _owned_root(root)
     (root / "notes.txt").write_text("the owner's own file")
+    (root / "models" / "mine.onnx").write_text("a model the owner placed")
+    (root / "logs" / "other.log").write_text("another program's log")
     assert cli.main(["purge", "--yes"]) == 1
     assert "did not create" in capsys.readouterr().err
-    assert sorted(p.name for p in root.iterdir()) == ["notes.txt"]
+    assert _tree(root) == ["logs", str(Path("logs/other.log")), "models", str(Path("models/mine.onnx")), "notes.txt"]
+
+
+def test_purge_keeps_user_folders_with_allowlisted_names(tmp_path):
+    root = tmp_path / "root"
+    _owned_root(root)  # its listed project folder goes; the unlisted one is the owner's
+    (root / "projects" / "myrepo").mkdir()
+    (root / "projects" / "myrepo" / "code.py").write_text("print('mine')")
+    (root / "cache" / "thumbnails").mkdir()
+    assert remove_root(root) is not None
+    assert _tree(root) == [
+        "cache",
+        str(Path("cache/thumbnails")),
+        "projects",
+        str(Path("projects/myrepo")),
+        str(Path("projects/myrepo/code.py")),
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions")
+def test_purge_never_follows_junctions(tmp_path):
+    root = tmp_path / "root"
+    (project_id,) = _owned_root(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not the program's")
+
+    def junction(link: Path) -> None:
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True, capture_output=True)
+
+    junction(root / "projects" / project_id / "linked")  # inside a project the catalog lists
+    (root / "cache" / "parsed").rmdir()
+    junction(root / "cache" / "parsed")  # an allow-listed entry that is itself a link
+    junction(root / "logs" / "host.log.1")
+    assert remove_root(root) is None
+    assert not root.exists() and (outside / "keep.txt").read_text() == "not the program's"
+
+
+def test_stop_and_purge_import_no_native_libraries(tmp_path):
+    script = (
+        "import sys\n"
+        "from emailsupersearch.cli import main\n"
+        "main(['stop'])\n"
+        "main(['purge', '--yes'])\n"
+        "print(sorted(m for m in ('numpy', 'onnxruntime', 'tokenizers', 'sqlite_vec') if m in sys.modules))\n"
+    )
+    env = {**os.environ, "EMAILSUPERSEARCH_DATA_ROOT": str(tmp_path / "root")}
+    done = subprocess.run(
+        [sys.executable, "-c", script], env=env, check=False, capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines()[-1] == "[]"

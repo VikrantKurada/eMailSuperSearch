@@ -97,6 +97,18 @@ def configure_logging(process_name: str, root: Path, level: str = "INFO") -> log
     return logger
 
 
+def close_logging() -> None:
+    """Close and detach every handler of the package logger and forget the per-process ones, so the log files can be
+    deleted (Windows will not delete an open file); a later ``configure_logging`` starts afresh."""
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    for handler in _HANDLERS.values():
+        handler.close()  # already closed above when attached; closing twice is harmless
+    _HANDLERS.clear()
+
+
 def log_subject(subject: str) -> str:
     """Return the subject at DEBUG, else a short hash of it."""
     if logging.getLogger(LOGGER_NAME).getEffectiveLevel() <= logging.DEBUG:

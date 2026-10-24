@@ -5,6 +5,9 @@ import os
 import re
 from pathlib import Path, PureWindowsPath
 
+from emailsupersearch import __version__
+
+MARKER_FILE = ".emailsupersearch"  # in a data root: this program made the folder, so a purge may empty it
 _KNOWN_FOLDERS = ("Documents", "Desktop")
 _KNOWN_FOLDERS_LOWER = {folder.lower() for folder in _KNOWN_FOLDERS}
 _DRIVE_RE = re.compile(r"[A-Za-z]:")
@@ -51,3 +54,15 @@ def ensure_layout(root: Path) -> None:
     """Create the standard sub-folders under the data root."""
     for sub in ("projects", "cache/parsed", "models", "logs"):
         (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+def mark_root(root: Path) -> None:
+    """Write the ownership marker (it holds the version that wrote it) unless the root already has one."""
+    marker = root / MARKER_FILE
+    if not marker.is_file():
+        marker.write_text(__version__, encoding="utf-8")
+
+
+def is_marked(root: Path) -> bool:
+    """Whether ``root`` carries the ownership marker, so it is a data root this program made."""
+    return (root / MARKER_FILE).is_file()

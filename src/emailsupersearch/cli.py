@@ -204,9 +204,10 @@ register("serve", _serve, _configure_serve)
 
 def _stop(args: argparse.Namespace) -> int:
     """Stop the running host."""
-    from emailsupersearch.host.launcher import resolve_root, stop
+    from emailsupersearch.host.launcher import resolve_root, stop_any
 
-    return stop(resolve_root())
+    # The default root too: after a data_root change the host still runs from the root it started on.
+    return stop_any([resolve_root(), data_root()])
 
 
 register("stop", _stop, lambda parser: None)
