@@ -72,6 +72,24 @@ def _file(row: sqlite3.Row) -> FileRecord:
     )
 
 
+_UPSERT_FILE = (
+    "INSERT INTO files(path, size, mtime_ns, sha256, file_id, message_key, parse_status, status_reason,"
+    " last_seen_scan_id, tombstoned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns,"
+    " sha256 = excluded.sha256, file_id = excluded.file_id, message_key = excluded.message_key,"
+    " parse_status = excluded.parse_status, status_reason = excluded.status_reason,"
+    " last_seen_scan_id = excluded.last_seen_scan_id, tombstoned_at = excluded.tombstoned_at"
+)
+
+
+def _file_values(rec: FileRecord) -> tuple[Any, ...]:
+    """The ``_UPSERT_FILE`` parameters for ``rec``."""
+    return (
+        rec.path, rec.size, rec.mtime_ns, rec.sha256, rec.file_id, rec.message_key,
+        rec.parse_status, rec.status_reason, rec.last_seen_scan_id, rec.tombstoned_at,
+    )
+
+
 def _under_roots(roots: Sequence[str]) -> tuple[str, list[str]]:
     """SQL condition (and its parameters) for "the path is one of ``roots`` or lies below one".
 
@@ -205,18 +223,20 @@ class ProjectStore:
 
     def upsert_file(self, rec: FileRecord) -> None:
         with self._lock, self.conn:
-            self.conn.execute(
-                "INSERT INTO files(path, size, mtime_ns, sha256, file_id, message_key, parse_status, status_reason,"
-                " last_seen_scan_id, tombstoned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns,"
-                " sha256 = excluded.sha256, file_id = excluded.file_id, message_key = excluded.message_key,"
-                " parse_status = excluded.parse_status, status_reason = excluded.status_reason,"
-                " last_seen_scan_id = excluded.last_seen_scan_id, tombstoned_at = excluded.tombstoned_at",
-                (
-                    rec.path, rec.size, rec.mtime_ns, rec.sha256, rec.file_id, rec.message_key,
-                    rec.parse_status, rec.status_reason, rec.last_seen_scan_id, rec.tombstoned_at,
-                ),
-            )
+            self.conn.execute(_UPSERT_FILE, _file_values(rec))
+
+    def upsert_files(self, recs: list[FileRecord]) -> None:
+        """Write many manifest rows in one transaction; the scanner flushes its buffered rows through this."""
+        with self._lock, self.conn:
+            self.conn.executemany(_UPSERT_FILE, [_file_values(rec) for rec in recs])
+
+    def move_file(self, old_path: str, new_path: str) -> None:
+        """Re-key the manifest row at ``old_path`` to ``new_path``, dropping any row already at ``new_path``."""
+        if old_path == new_path:
+            return
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM files WHERE path = ?", (new_path,))
+            self.conn.execute("UPDATE files SET path = ? WHERE path = ?", (new_path, old_path))
 
     def stamp_seen(self, paths: list[str], scan_id: int) -> None:
         """Record that ``paths`` were seen in ``scan_id``; a tombstoned path that reappears is revived."""

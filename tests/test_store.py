@@ -178,6 +178,30 @@ def test_upsert_file_overwrites_every_column(tmp_store, corpus_dir):
     assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 1
 
 
+def test_upsert_files_writes_many_rows_in_one_call(tmp_store, corpus_dir):
+    a, b = (os.path.join(str(corpus_dir), name) for name in ("a.eml", "b.eml"))
+    tmp_store.upsert_file(_rec(a, size=1, sha256="old"))
+    batch = [_rec(a, size=2, sha256="new", file_id="f1", parse_status="pending"), _rec(b, message_key="m2")]
+    tmp_store.upsert_files(batch)
+    assert tmp_store.get_file(a) == batch[0] and tmp_store.get_file(b) == batch[1]
+    assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 2
+    tmp_store.upsert_files([])
+    assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 2
+
+
+def test_move_file_rekeys_the_row_and_replaces_the_target(tmp_store, corpus_dir):
+    old, new = (os.path.join(str(corpus_dir), name) for name in ("old.eml", "new.eml"))
+    tmp_store.upsert_file(_rec(old, sha256="aa", file_id="f1", message_key="m1", tombstoned_at=7))
+    tmp_store.upsert_file(_rec(new, sha256="bb", file_id="f2", message_key="m2"))
+    tmp_store.move_file(old, new)
+    assert tmp_store.get_file(old) is None
+    assert tmp_store.get_file(new) == _rec(new, sha256="aa", file_id="f1", message_key="m1", tombstoned_at=7)
+    assert tmp_store.find_by_file_id("f1").path == new and tmp_store.find_by_file_id("f2") is None
+    assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 1
+    tmp_store.move_file(new, new)  # moving a row onto itself changes nothing
+    assert tmp_store.get_file(new) is not None
+
+
 def test_manifest_batches_large_path_lists(tmp_store, corpus_dir):
     paths = [os.path.join(str(corpus_dir), f"m{i}.eml") for i in range(1300)]  # more than 500 per statement
     for p in paths:
