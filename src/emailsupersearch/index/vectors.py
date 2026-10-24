@@ -11,7 +11,8 @@ from emailsupersearch.index.candidates import candidate_clause
 MAX_K = 4096
 
 
-def _blob(vector: np.ndarray, dim: int) -> bytes:
+def serialize_vector(vector: np.ndarray, dim: int) -> bytes:
+    """The ``chunks_vec`` blob of one vector; raises ``ValueError`` for a wrong shape or a NaN or infinity."""
     if vector.shape != (dim,):
         raise ValueError(f"expected a vector of shape ({dim},), got {vector.shape}")
     if not np.isfinite(vector).all():
@@ -35,7 +36,7 @@ class VectorIndex:
 
     def upsert(self, rows: list[tuple[int, np.ndarray]]) -> None:
         """Store each vector under its chunk rowid, replacing any existing one, in one transaction."""
-        blobs = [(int(rowid), _blob(vector, self.dim)) for rowid, vector in rows]
+        blobs = [(int(rowid), serialize_vector(vector, self.dim)) for rowid, vector in rows]
         with self.conn:
             self.conn.executemany("DELETE FROM chunks_vec WHERE chunk_rowid = ?", [(rowid,) for rowid, _ in blobs])
             self.conn.executemany("INSERT INTO chunks_vec(chunk_rowid, embedding) VALUES (?, ?)", blobs)
@@ -51,7 +52,7 @@ class VectorIndex:
         restricts the search to those chunk rowids before the nearest-neighbour scan; an empty list
         matches nothing and ``None`` searches everything.
         """
-        blob = _blob(query, self.dim)
+        blob = serialize_vector(query, self.dim)
         k = min(k, MAX_K)
         if k < 1 or (candidates is not None and not candidates):
             return []

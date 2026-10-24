@@ -6,9 +6,15 @@ stored with its attachments and chunks; the chunks are embedded, and attachments
 OCR. ``apply_scan`` runs it over one scan result, ``remove_path`` handles a purged file and ``attach_ocr_text``
 brings in an OCR result.
 
+Every step that can fail without touching the store runs first: parsing, chain lookup, quote stripping, chunking
+and embedding. Only then is the message written, by ``ProjectStore.write_indexed_message`` in one transaction
+(message, attachments, chunks, vectors and chain rows), so an error leaves the stored message as it was. Queueing
+OCR comes after that transaction and cannot fail the file.
+
 The supervisor calls every method from its single worker thread. Chain assignment reads the stored messages before
-one is written (``assign_chain``, then ``upsert_message``, then ``update_chain_row``), and that one thread is what
-keeps the chain bookkeeping consistent: the pipeline adds no lock around those steps beyond the store's own.
+the message is written (``assign_chain``, then the store's write, which recomputes the chain rows inside its
+transaction), and that one thread is what keeps the chain bookkeeping consistent: the pipeline adds no lock around
+those steps beyond the store's own.
 
 Every file row the pipeline handles leaves ``pending``, as ``indexed``, ``indexed_partial`` or ``failed`` (a
 duplicate export is ``indexed`` with the reason ``duplicate``), and the row is written only through
@@ -26,13 +32,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from emailsupersearch.index.chains import assign_chain, update_chain_row
+from emailsupersearch.index.vectors import serialize_vector
 from emailsupersearch.ingest.chunker import (
     MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT,
     Chunker,
@@ -44,7 +51,8 @@ from emailsupersearch.ingest.identity import message_key
 from emailsupersearch.ingest.parse import ParseError
 from emailsupersearch.ingest.parse_cache import ParseCache, append_ocr_text, sha256_file
 from emailsupersearch.ingest.workers import ParseMemoryExceeded, ParsePool, ParseTimeout
-from emailsupersearch.logging_setup import log_subject
+from emailsupersearch.logging_setup import log_subject, redact
+from emailsupersearch.store import PartWrite
 from emailsupersearch.types import AttachmentText, ParsedDocument, ParsedMessage
 
 if TYPE_CHECKING:
@@ -82,24 +90,20 @@ class IngestOutcome:
     ocr_jobs: int = 0
 
 
-@dataclass
-class _Part:
-    """One part of a message on its way into the store: ``body`` or ``att:<ordinal>``."""
-
-    name: str
-    ordinal: int | None  # the attachment's ordinal; None for the body
-    chunks: list[ChunkText]
-    truncated: bool = False  # a chunk's text was cut at CHUNK_TEXT_MAX_CHARS
-    rowids: list[int] = field(default_factory=list)
-
-
 def _timeout_reason(e: ParseTimeout) -> str:
     """``timeout`` when the worker ran out of time, else the pool's own message (``pool closed``, ``worker died: ...``).
 
-    The message is ``e.reason``: ``str(e)`` puts the path in front, which a folder named "timeouts" would misread.
+    The message is ``e.reason``; ``str(e)`` puts the path in front of it.
     """
-    msg = e.reason
-    return "timeout" if (not msg or "timeout" in msg.lower() or "timed out" in msg.lower()) else msg[:_REASON_MAX_CHARS]
+    msg = e.reason or "timeout"
+    return "timeout" if msg == "timeout" else msg[:_REASON_MAX_CHARS]
+
+
+def _error_reason(e: Exception) -> str:
+    """The recorded reason for an unexpected error. An ``OSError`` gives its ``strerror``: its text names the path."""
+    if isinstance(e, OSError):
+        return (e.strerror or type(e).__name__)[:_REASON_MAX_CHARS]
+    return f"{type(e).__name__}: {e}"[:_REASON_MAX_CHARS]
 
 
 class IngestPipeline:
@@ -161,14 +165,21 @@ class IngestPipeline:
         return key
 
     def apply_scan(self, result: ScanResult) -> list[IngestOutcome]:
-        """Act on one scan: announce its renames (the scan already moved those rows), parse ``to_parse`` and
-        remove what it purged."""
+        """Act on one scan: announce its renames (the scan already moved those rows), remove what it purged, then
+        parse ``to_parse``.
+
+        The scan has already deleted the purged rows, so their messages are removed first, and one failed removal
+        does not stop the others or the parsing.
+        """
         for old, new in result.renamed:
             self._emit({"type": "renamed", "old": old, "new": new})
-        outcomes = [self.ingest_file(path, result.scan_id) for path in result.to_parse]
         for rec in result.purged:
-            self.remove_path(rec.path, rec.message_key)
-        return outcomes
+            try:
+                self.remove_path(rec.path, rec.message_key)
+            except Exception as e:
+                log.warning("removing a purged file failed: %s", type(e).__name__)
+                log.debug("removing %s failed", rec.path, exc_info=True)
+        return [self.ingest_file(path, result.scan_id) for path in result.to_parse]
 
     def attach_ocr_text(self, sha256: str, ordinal: int, text: str) -> None:
         """Bring in the OCR text of attachment ``ordinal`` of the file whose bytes hash to ``sha256``.
@@ -193,21 +204,21 @@ class IngestPipeline:
         key: str | None = None
         doc: ParsedDocument | None = None
         try:
-            sha, doc = self._parse(path)
+            doc = self._parse(path)
             key = message_key(doc.message)
             if self._is_duplicate(where, key):
                 self._record(where, key, "indexed", "duplicate")
                 log.info("duplicate export of a stored message: %s", log_subject(doc.message.subject))
                 return IngestOutcome(where, key, "skipped_duplicate", "duplicate")
-            return self._index(path, sha, doc, key)
+            return self._index(path, doc, key)
         except ParseTimeout as e:
             reason, kind = _timeout_reason(e), "timeout"
         except ParseMemoryExceeded:
             reason = kind = "memory_cap"
         except ParseError as e:
-            reason, kind = str(e)[:_REASON_MAX_CHARS], "parse_error"
+            reason, kind = redact(str(e))[:_REASON_MAX_CHARS], "parse_error"
         except Exception as e:
-            reason, kind = f"{type(e).__name__}: {e}"[:_REASON_MAX_CHARS], None
+            reason, kind = _error_reason(e), None
             subject = log_subject(doc.message.subject) if doc is not None else "an unparsed file"
             log.warning("indexing failed for %s: %s", subject, type(e).__name__)
             log.debug("indexing failed", exc_info=True)
@@ -216,42 +227,41 @@ class IngestPipeline:
             log.debug("parse failed for %s: %s", where, reason)
         return self._fail(where, key, reason)
 
-    def _parse(self, path: Path) -> tuple[str, ParsedDocument]:
-        """The file's hash and its parsed document, from the cache when it holds the hash, else from the pool."""
-        sha = sha256_file(path)
-        doc = self.cache.get(sha)
-        if doc is None:
-            doc = self.pool.parse(path)
+    def _parse(self, path: Path) -> ParsedDocument:
+        """The parsed document, from the cache when it holds the file's hash, else from the pool (then cached)."""
+        doc = self.cache.get(sha256_file(path))
+        if doc is not None:
+            return doc
+        doc = self.pool.parse(path)
+        try:
             self.cache.put(doc)
-        return sha, doc
+        except Exception as e:  # a full or read-only cache disk costs a re-parse later, not this file
+            log.warning("the parse cache could not keep a document: %s", type(e).__name__)
+            log.debug("caching the parse of %s failed", path, exc_info=True)
+        return doc
 
     def _is_duplicate(self, where: str, key: str) -> bool:
         """Whether the message is already stored and another live path holds it (an export of the same email)."""
         others = [p for p in self.store.paths_for_message(key) if p != where]
         return bool(others) and self.store.message(key) is not None
 
-    def _index(self, path: Path, sha: str, doc: ParsedDocument, key: str) -> IngestOutcome:
-        m = doc.message
-        chain_id, previous_chain, text = self._store_message(doc, key)
-        parts = self._parts(m, text, doc.attachments)
-        self._store_chunks(key, parts)
-        self._embed(key, parts)
-        update_chain_row(self.store, chain_id)
-        if previous_chain is not None and previous_chain != chain_id:
-            update_chain_row(self.store, previous_chain)  # a re-ingested message can move to another chain
-        ocr_jobs = self._enqueue_ocr(path, sha, doc.attachments)
-        return self._finish(str(path), key, m.subject, doc.attachments, parts, ocr_jobs)
-
-    def _store_message(self, doc: ParsedDocument, key: str) -> tuple[str, str | None, str]:
-        """Write the message and its attachment rows; returns its chain, the chain it had before, and its new text."""
+    def _index(self, path: Path, doc: ParsedDocument, key: str) -> IngestOutcome:
+        """Do all the work that can fail without touching the store, then write the message in one transaction."""
         m = doc.message
         stored = self.store.message(key)
         previous_chain = stored["chain_id"] if stored is not None else None
         chain_id, depth = assign_chain(self.store, m, key)
         text = new_text(m.body_text, self._has_parent(chain_id, key, m.sent_ts))
-        self.store.upsert_message(m, key, text, chain_id, depth)
-        self.store.upsert_attachments(key, doc.attachments, "pending" if self.enqueue_ocr is not None else "unavailable")
-        return chain_id, previous_chain, text
+        parts, truncated = self._parts(m, text, doc.attachments)
+        nonfinite = self._embed(parts)
+        ocr_default = "pending" if self.enqueue_ocr is not None else "unavailable"
+        chains = [c for c in (chain_id, previous_chain) if c is not None]  # a re-ingest can move to another chain
+        rowids = self.store.write_indexed_message(
+            m, key, text, chain_id, depth, doc.attachments, ocr_default, parts, chains
+        )
+        _log_nonfinite(rowids, nonfinite)
+        ocr_jobs = self._enqueue_ocr(path, doc, key)
+        return self._finish(str(path), key, m.subject, doc.attachments, parts, truncated, ocr_jobs)
 
     def _has_parent(self, chain_id: str, key: str, sent_ts: int | None) -> bool:
         """Whether the chain already holds an earlier message (any other message when this one is undated)."""
@@ -262,86 +272,100 @@ class IngestPipeline:
                 row = self.store.conn.execute(_EARLIER_IN_CHAIN, (chain_id, key, sent_ts)).fetchone()
         return row is not None
 
-    def _parts(self, m: ParsedMessage, text: str, attachments: list[AttachmentText]) -> list[_Part]:
-        """The body and every attachment with text, chunked under their context lines."""
+    def _parts(self, m: ParsedMessage, text: str, attachments: list[AttachmentText]) -> tuple[list[PartWrite], bool]:
+        """The body and every attachment with text, chunked under their context lines; also whether any chunk
+        was cut at ``CHUNK_TEXT_MAX_CHARS``."""
         sender = m.sender_name or m.sender_addr
-        parts = [self._part("body", None, text, context_line_for(sender, m.sent_ts, m.subject, "body"))]
-        for att in attachments:
-            if att.text:
-                line = context_line_for(sender, m.sent_ts, m.subject, att.filename)
-                parts.append(self._part(f"att:{att.ordinal}", att.ordinal, att.text, line))
-        return parts
+        specs = [("body", None, text, "body")]
+        specs += [(f"att:{a.ordinal}", a.ordinal, a.text, a.filename) for a in attachments if a.text]
+        parts: list[PartWrite] = []
+        truncated = False
+        for name, ordinal, body, label in specs:
+            part, cut = self._part(name, ordinal, body, context_line_for(sender, m.sent_ts, m.subject, label))
+            parts.append(part)
+            truncated = truncated or cut
+        return parts, truncated
 
-    def _part(self, name: str, ordinal: int | None, text: str, context_line: str) -> _Part:
-        """Chunk one part, cutting every chunk's text at ``CHUNK_TEXT_MAX_CHARS``."""
-        part = _Part(name, ordinal, [])
+    def _part(self, name: str, ordinal: int | None, text: str, context_line: str) -> tuple[PartWrite, bool]:
+        """Chunk one part, cutting every chunk's text at ``CHUNK_TEXT_MAX_CHARS``; also whether any was cut."""
+        chunks: list[ChunkText] = []
+        truncated = False
         for c in self.chunker.chunk(text, context_line):
             if len(c.text) > CHUNK_TEXT_MAX_CHARS:
                 c = ChunkText(c.idx, c.text[:CHUNK_TEXT_MAX_CHARS], c.token_count)
-                part.truncated = True
-            part.chunks.append(c)
-        return part
+                truncated = True
+            chunks.append(c)
+        return PartWrite(name, ordinal, chunks), truncated
 
-    def _store_chunks(self, key: str, parts: list[_Part]) -> None:
-        """Replace the message's chunks part by part; parts it no longer has (a removed attachment) are cleared."""
-        current = {p.name for p in parts}
-        for stale in self.store.chunk_parts(key):
-            if stale not in current:
-                self.store.replace_chunks(key, stale, [])
-        for part in parts:
-            part.rowids = self.store.replace_chunks(key, part.name, part.chunks)
+    def _embed(self, parts: list[PartWrite]) -> list[list[int]]:
+        """Embed every body chunk and the first ``MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT`` chunks of each attachment,
+        filling each part's ``embeddings``; an attachment with more chunks is marked ``embedded_partial``.
 
-    def _embed(self, key: str, parts: list[_Part]) -> None:
-        """Embed every body chunk and the first ``MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT`` chunks of each attachment.
-
-        An attachment with more chunks keeps them keyword-only and is marked ``embedded_partial``.
+        Touches no store. Returns, per part, the chunk positions whose vector was not finite: those are skipped and
+        stay keyword-only.
         """
+        nonfinite: list[list[int]] = [[] for _ in parts]
         if self.embedder is None or self.vectors is None:
-            return
-        rowids: list[int] = []
-        texts: list[str] = []
-        for part in parts:
+            return nonfinite
+        todo: list[tuple[int, int, str]] = []  # (part index, chunk position, text)
+        for i, part in enumerate(parts):
             take = len(part.chunks) if part.ordinal is None else MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT
-            rowids += part.rowids[:take]
-            texts += [c.text for c in part.chunks[:take]]
-            if part.ordinal is not None and len(part.chunks) > take:
-                self.store.set_attachment_status(key, part.ordinal, embedded_partial=True)
-        for start in range(0, len(rowids), _EMBED_BATCH):
-            self._embed_batch(rowids[start : start + _EMBED_BATCH], texts[start : start + _EMBED_BATCH])
+            part.embedded_partial = len(part.chunks) > take
+            todo += [(i, position, c.text) for position, c in enumerate(part.chunks[:take])]
+        for start in range(0, len(todo), _EMBED_BATCH):
+            batch = todo[start : start + _EMBED_BATCH]
+            vectors = self.embedder.embed([text for _, _, text in batch], batch_size=_EMBED_BATCH)
+            for (i, position, _), vector in zip(batch, vectors, strict=True):
+                if np.isfinite(vector).all():
+                    parts[i].embeddings[position] = serialize_vector(vector, self.vectors.dim)
+                else:
+                    nonfinite[i].append(position)
+        return nonfinite
 
-    def _embed_batch(self, rowids: list[int], texts: list[str]) -> None:
-        """Embed and store one batch; a row whose vector is not finite is skipped and stays ``embedded = 0``."""
-        rows: list[tuple[int, np.ndarray]] = []
-        for rowid, vector in zip(rowids, self.embedder.embed(texts, batch_size=_EMBED_BATCH), strict=True):
-            if np.isfinite(vector).all():
-                rows.append((rowid, vector))
-            else:
-                log.debug("chunk %d has a non-finite embedding; it stays keyword-only", rowid)
-        if rows:
-            with self.store.lock:  # the vector index writes through the store's writer connection
-                self.vectors.upsert(rows)
-                self.store.mark_embedded([rowid for rowid, _ in rows])
+    def _enqueue_ocr(self, path: Path, doc: ParsedDocument, key: str) -> int:
+        """Queue one OCR job per attachment with pages to read; returns how many were queued.
 
-    def _enqueue_ocr(self, path: Path, sha: str, attachments: list[AttachmentText]) -> int:
-        """Queue one OCR job per attachment with pages to read; returns how many were queued."""
+        Never raises: an attachment whose job could not be queued is marked ``ocr_status = "unavailable"``. The job
+        names the cache entry (``doc.sha256``) that ``attach_ocr_text`` will update.
+        """
         if self.enqueue_ocr is None:
             return 0
         queued = 0
-        for att in attachments:
-            if att.status == "needs_ocr" and att.needs_ocr_pages:
-                job = {"path": str(path), "sha256": sha, "ordinal": att.ordinal, "pages": list(att.needs_ocr_pages)}
+        for att in doc.attachments:
+            if att.status != "needs_ocr" or not att.needs_ocr_pages:
+                continue
+            job = {"path": str(path), "sha256": doc.sha256, "ordinal": att.ordinal, "pages": list(att.needs_ocr_pages)}
+            try:
                 self.enqueue_ocr(job)
                 queued += 1
+            except Exception as e:
+                log.warning("an OCR job could not be queued: %s", type(e).__name__)
+                log.debug("queueing OCR for %s failed", path, exc_info=True)
+                self._mark_ocr_unavailable(key, att.ordinal)
         return queued
 
+    def _mark_ocr_unavailable(self, key: str, ordinal: int) -> None:
+        try:
+            self.store.set_attachment_status(key, ordinal, ocr_status="unavailable")
+        except Exception as e:
+            log.warning("could not mark an attachment's OCR unavailable: %s", type(e).__name__)
+            log.debug("marking attachment %d of %s failed", ordinal, key, exc_info=True)
+
     def _finish(
-        self, where: str, key: str, subject: str, attachments: list[AttachmentText], parts: list[_Part], ocr_jobs: int
+        self,
+        where: str,
+        key: str,
+        subject: str,
+        attachments: list[AttachmentText],
+        parts: list[PartWrite],
+        truncated: bool,
+        ocr_jobs: int,
     ) -> IngestOutcome:
         """Record the file as ``indexed``, or ``indexed_partial`` when an attachment could not be read."""
         skipped = sum(1 for att in attachments if att.status in _NOT_INDEXED)
         status: IngestStatus = "indexed_partial" if skipped else "indexed"
         notes = [f"{skipped} attachments not indexed"] if skipped else []
-        if any(p.truncated for p in parts):
+        if truncated:
             notes.append(CHUNK_TRUNCATED_NOTE)
         reason = "; ".join(notes)
         self._record(where, key, status, reason)
@@ -359,8 +383,8 @@ class IngestPipeline:
             self._drop_if_orphaned(rec.message_key)
 
     def _fail(self, where: str, key: str | None, reason: str) -> IngestOutcome:
-        """Record a failed file. A message the path already held keeps its link and stays as it was; a message
-        this attempt wrote under another key goes when no live path links it."""
+        """Record a failed file. A message the path already held keeps its link and stays as it was; a message under
+        another key, which no live path links, goes. The outcome names the kept message, or None."""
         kept: str | None = None
         try:
             rec = self.store.get_file(where)
@@ -371,7 +395,7 @@ class IngestPipeline:
         except Exception as e:
             log.warning("could not record a failed file: %s", type(e).__name__)
             log.debug("recording the failure of %s failed", where, exc_info=True)
-        return IngestOutcome(where, kept if kept is not None else key, "failed", reason)
+        return IngestOutcome(where, kept, "failed", reason)
 
     def _drop_if_orphaned(self, key: str) -> None:
         """Delete the message (chunks and vectors too) when no live path links it, then recompute its chain row."""
@@ -393,10 +417,22 @@ class IngestPipeline:
             return
         sender = stored["sender_name"] or stored["sender_addr"] or ""
         line = context_line_for(sender, stored["sent_ts"], stored["subject"] or "", att["filename"] or "")
-        part = self._part(f"att:{ordinal}", ordinal, text, line)
-        part.rowids = self.store.replace_chunks(key, part.name, part.chunks)
-        self._embed(key, [part])
+        part, truncated = self._part(f"att:{ordinal}", ordinal, text, line)
+        nonfinite = self._embed([part])
+        rowids = self.store.write_part(key, part)
+        _log_nonfinite([rowids], nonfinite)
         self.store.set_attachment_status(key, ordinal, extract_status="ok", ocr_status="ok", text_chars=len(text))
+        if truncated:
+            self._note_truncation(key)
+
+    def _note_truncation(self, key: str) -> None:
+        """Add ``CHUNK_TRUNCATED_NOTE`` to the reason of every live file of the message, keeping its status."""
+        for path in self.store.paths_for_message(key):
+            rec = self.store.get_file(path)
+            if rec is None or CHUNK_TRUNCATED_NOTE in rec.status_reason:
+                continue
+            reason = "; ".join(r for r in (rec.status_reason, CHUNK_TRUNCATED_NOTE) if r)
+            self.store.set_file_parse_result(path, rec.message_key, rec.parse_status, reason)
 
     def _emit(self, event: dict) -> None:
         if self.on_event is None:
@@ -406,3 +442,10 @@ class IngestPipeline:
         except Exception as e:
             log.warning("an event callback failed: %s", type(e).__name__)
             log.debug("event callback failed for %r", event, exc_info=True)
+
+
+def _log_nonfinite(rowids: list[list[int]], nonfinite: list[list[int]]) -> None:
+    """Log, at DEBUG and by rowid only, every chunk whose embedding was skipped for not being finite."""
+    for part_rowids, positions in zip(rowids, nonfinite, strict=True):
+        for position in positions:
+            log.debug("chunk %d has a non-finite embedding; it stays keyword-only", part_rowids[position])

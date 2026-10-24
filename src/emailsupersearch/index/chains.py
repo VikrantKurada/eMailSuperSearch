@@ -11,7 +11,8 @@ the chain named by, in this order:
 4. otherwise a new chain, ``c-<first 16 characters of the message key>``.
 
 Reads run on the writer connection under ``store.lock``, as plain SELECTs with no transaction of their own;
-``update_chain_row`` writes under ``store.lock`` inside one transaction.
+``update_chain_row`` writes under ``store.lock`` inside one transaction. ``recompute_chain_row`` is the same write for
+a caller that already holds the lock and has a transaction open (the store's ``write_indexed_message``).
 """
 
 from __future__ import annotations
@@ -132,44 +133,49 @@ def _distinct_people(rows: Iterable[tuple[str | None, str | None]]) -> list[dict
 
 
 def update_chain_row(store: ProjectStore, chain_id: str) -> None:
+    """Recompute the ``chains`` row of ``chain_id`` from its messages, in its own transaction (``recompute_chain_row``)."""
+    with store.lock, store.conn:
+        recompute_chain_row(store.conn, chain_id)
+
+
+def recompute_chain_row(conn: sqlite3.Connection, chain_id: str) -> None:
     """Recompute the ``chains`` row of ``chain_id`` from its messages; delete the row when none are left.
 
-    The root is the earliest message (undated ones last, then by key). Participants are listed as senders,
-    ``to`` and ``cc`` recipients in the order the dated messages were sent; ``bcc`` is never listed.
+    The caller holds the store's lock and has a transaction open; this opens none of its own. The root is the
+    earliest message (undated ones last, then by key). Participants are listed as senders, ``to`` and ``cc``
+    recipients in the order the dated messages were sent; ``bcc`` is never listed.
     """
-    with store.lock, store.conn:
-        conn = store.conn
-        count, first_ts, last_ts = conn.execute(
-            "SELECT COUNT(*), MIN(sent_ts), MAX(sent_ts) FROM messages WHERE chain_id = ?", (chain_id,)
-        ).fetchone()
-        if count == 0:
-            conn.execute("DELETE FROM chains WHERE chain_id = ?", (chain_id,))
-            return
-        rows = conn.execute(
-            "SELECT message_key, subject, sender_name, sender_addr FROM messages WHERE chain_id = ?"
-            " ORDER BY sent_ts IS NULL, sent_ts, message_key",
-            (chain_id,),
-        ).fetchall()
-        recipients = conn.execute(
-            "SELECT r.kind, r.name, r.addr FROM recipients r JOIN messages m ON m.message_key = r.message_key"
-            " WHERE m.chain_id = ? AND r.kind IN ('to', 'cc')"
-            " ORDER BY m.sent_ts IS NULL, m.sent_ts, m.message_key, r.rowid",
-            (chain_id,),
-        ).fetchall()
-        root = rows[0]
-        participants = {
-            "from": _distinct_people((r["sender_name"], r["sender_addr"]) for r in rows),
-            "to": _distinct_people((r["name"], r["addr"]) for r in recipients if r["kind"] == "to"),
-            "cc": _distinct_people((r["name"], r["addr"]) for r in recipients if r["kind"] == "cc"),
-        }
-        conn.execute(
-            "INSERT INTO chains(chain_id, root_message_key, subject, first_ts, last_ts, message_count, participants_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(chain_id) DO UPDATE SET root_message_key = excluded.root_message_key,"
-            " subject = excluded.subject, first_ts = excluded.first_ts, last_ts = excluded.last_ts,"
-            " message_count = excluded.message_count, participants_json = excluded.participants_json",
-            (
-                chain_id, root["message_key"], normalize_subject(root["subject"] or ""), first_ts, last_ts, count,
-                json.dumps(participants),
-            ),
-        )
+    count, first_ts, last_ts = conn.execute(
+        "SELECT COUNT(*), MIN(sent_ts), MAX(sent_ts) FROM messages WHERE chain_id = ?", (chain_id,)
+    ).fetchone()
+    if count == 0:
+        conn.execute("DELETE FROM chains WHERE chain_id = ?", (chain_id,))
+        return
+    rows = conn.execute(
+        "SELECT message_key, subject, sender_name, sender_addr FROM messages WHERE chain_id = ?"
+        " ORDER BY sent_ts IS NULL, sent_ts, message_key",
+        (chain_id,),
+    ).fetchall()
+    recipients = conn.execute(
+        "SELECT r.kind, r.name, r.addr FROM recipients r JOIN messages m ON m.message_key = r.message_key"
+        " WHERE m.chain_id = ? AND r.kind IN ('to', 'cc')"
+        " ORDER BY m.sent_ts IS NULL, m.sent_ts, m.message_key, r.rowid",
+        (chain_id,),
+    ).fetchall()
+    root = rows[0]
+    participants = {
+        "from": _distinct_people((r["sender_name"], r["sender_addr"]) for r in rows),
+        "to": _distinct_people((r["name"], r["addr"]) for r in recipients if r["kind"] == "to"),
+        "cc": _distinct_people((r["name"], r["addr"]) for r in recipients if r["kind"] == "cc"),
+    }
+    conn.execute(
+        "INSERT INTO chains(chain_id, root_message_key, subject, first_ts, last_ts, message_count, participants_json)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(chain_id) DO UPDATE SET root_message_key = excluded.root_message_key,"
+        " subject = excluded.subject, first_ts = excluded.first_ts, last_ts = excluded.last_ts,"
+        " message_count = excluded.message_count, participants_json = excluded.participants_json",
+        (
+            chain_id, root["message_key"], normalize_subject(root["subject"] or ""), first_ts, last_ts, count,
+            json.dumps(participants),
+        ),
+    )

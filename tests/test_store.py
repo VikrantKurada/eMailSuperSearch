@@ -5,9 +5,10 @@ import threading
 import numpy as np
 import pytest
 
+from emailsupersearch import store as store_module
 from emailsupersearch.db.schema import SCHEMA_VERSION, SchemaTooNew, schema_version
 from emailsupersearch.ingest.chunker import ChunkText
-from emailsupersearch.store import FileRecord, ProjectStore, ScanUpdate
+from emailsupersearch.store import FileRecord, PartWrite, ProjectStore, ScanUpdate
 from emailsupersearch.types import AttachmentText, ParsedAttachment, Recipient
 
 
@@ -479,6 +480,47 @@ def test_chunk_parts_lists_the_distinct_parts_of_a_message(tmp_store):
     tmp_store.replace_chunks("m1", "att:1", [])
     assert tmp_store.chunk_parts("m1") == ["att:0", "body"]
     assert tmp_store.chunk_parts("none") == []
+
+
+def test_write_indexed_message_writes_everything_in_one_transaction(tmp_store, parsed_factory, monkeypatch):
+    m = parsed_factory(message_id="<w@example.com>", attachments=[_parsed_att()])
+    tmp_store.replace_chunks("w", "att:9", _chunks("stale part"))  # a part the message no longer has
+    parts = [
+        PartWrite("body", None, _chunks("alpha one", "beta two"), {1: _vec_blob(0.1)}),
+        PartWrite("att:0", 0, _chunks("gamma three"), {0: _vec_blob(0.2)}, embedded_partial=True),
+    ]
+    rowids = tmp_store.write_indexed_message(m, "w", "new text", "c-w", 0, [_att(0)], "pending", parts, ["c-w", "c-w"])
+    assert [len(r) for r in rowids] == [2, 1]
+    assert tmp_store.message("w")["new_text"] == "new text" and tmp_store.chunk_parts("w") == ["att:0", "body"]
+    embedded = {r["id"]: r["embedded"] for r in tmp_store.conn.execute("SELECT id, embedded FROM chunks")}
+    assert embedded == {rowids[0][0]: 0, rowids[0][1]: 1, rowids[1][0]: 1}
+    assert _vec_ids(tmp_store) == {rowids[0][1], rowids[1][0]}
+    assert _count(tmp_store, "SELECT embedded_partial FROM attachments WHERE message_key = 'w' AND ordinal = 0") == 1
+    assert _count(tmp_store, "SELECT message_count FROM chains WHERE chain_id = 'c-w'") == 1
+
+    def late_failure(conn, chain_id):
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(store_module, "recompute_chain_row", late_failure)
+    changed = parsed_factory(message_id="<w@example.com>", subject="Changed")
+    with pytest.raises(RuntimeError):
+        tmp_store.write_indexed_message(
+            changed, "w", "other text", "c-w", 0, [], "pending", [PartWrite("body", None, _chunks("delta"))], ["c-w"]
+        )
+    assert tmp_store.message("w")["new_text"] == "new text" and tmp_store.message("w")["subject"] == "Hello"
+    assert tmp_store.chunk_parts("w") == ["att:0", "body"] and _vec_ids(tmp_store) == {rowids[0][1], rowids[1][0]}
+    assert _count(tmp_store, "SELECT COUNT(*) FROM attachments WHERE message_key = 'w'") == 1
+
+
+def test_write_part_replaces_one_part_with_its_vectors(tmp_store):
+    tmp_store.upsert_attachments("m", [_att(0)], "pending")
+    first = tmp_store.write_part("m", PartWrite("att:0", 0, _chunks("one", "two"), {0: _vec_blob(0.1), 1: _vec_blob(0.2)}))
+    assert _vec_ids(tmp_store) == set(first)
+    body = tmp_store.replace_chunks("m", "body", _chunks("body text"))
+    second = tmp_store.write_part("m", PartWrite("att:0", 0, _chunks("three"), {}, embedded_partial=True))
+    assert tmp_store.chunk_rowids("m") == second + body
+    assert _vec_ids(tmp_store) == set()  # the replaced chunks took their vectors with them
+    assert _count(tmp_store, "SELECT embedded_partial FROM attachments WHERE message_key = 'm' AND ordinal = 0") == 1
 
 
 def test_delete_message_removes_chunks_and_vec_rows(tmp_store, parsed_factory, corpus_dir):

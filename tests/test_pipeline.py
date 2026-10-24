@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 from email.message import EmailMessage
 
 import numpy as np
@@ -6,7 +7,8 @@ import pytest
 from helpers import LONG_TEXT_30000_WORDS, att_docx, write_minimal_pdf
 
 from emailsupersearch import logging_setup
-from emailsupersearch.diagnostics.corpus import TOPICS
+from emailsupersearch import store as store_module
+from emailsupersearch.diagnostics.corpus import TOPICS, make_eml_bytes
 from emailsupersearch.index.fts import keyword_search
 from emailsupersearch.index.vectors import VectorIndex
 from emailsupersearch.ingest import pipeline as pipeline_module
@@ -72,6 +74,19 @@ def _raise(error):
         raise error
 
     return parse
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("boom")
+
+
+def _snapshot(store, key):
+    """Everything an indexed message is stored as: its new text, chunks, vectors and attachment rows."""
+    chunks = [tuple(r) for r in store.conn.execute(
+        "SELECT id, part, idx, text, embedded FROM chunks WHERE message_key=? ORDER BY id", (key,)
+    )]
+    atts = [tuple(r) for r in store.conn.execute("SELECT * FROM attachments WHERE message_key=? ORDER BY ordinal", (key,))]
+    return store.message(key)["new_text"], chunks, sorted(_vec_ids(store)), atts
 
 
 @pytest.fixture
@@ -283,21 +298,17 @@ def test_parse_timeout_records_messages_other_than_timeout(pipeline, corpus_dir,
     assert pipeline.store.get_file(str(p)).status_reason == message
 
 
-def _indexed_state(store, key):
-    return store.message(key)["new_text"], store.chunk_rowids(key), _vec_ids(store)
-
-
 def test_failed_reingest_keeps_indexed_message(pipeline, corpus_dir, monkeypatch):
     p = min(corpus_dir.glob("*.eml"))
     _scan(pipeline, corpus_dir)
     k = pipeline.ingest_file(p, 1).message_key
-    before = _indexed_state(pipeline.store, k)
+    before = _snapshot(pipeline.store, k)
     p.write_bytes(b"X-Changed: 1\n" + p.read_bytes())  # new bytes, so the cache misses and the pool parses
     monkeypatch.setattr(pipeline.pool, "parse", _raise(ParseTimeout(p)))
     assert pipeline.ingest_file(p, 2) == IngestOutcome(str(p), k, "failed", "timeout")
     rec = pipeline.store.get_file(str(p))
     assert (rec.message_key, rec.parse_status, rec.status_reason) == (k, "failed", "timeout")
-    assert _indexed_state(pipeline.store, k) == before
+    assert _snapshot(pipeline.store, k) == before
     assert pipeline.store.conn.execute("SELECT SUM(message_count) FROM chains").fetchone()[0] == 1
 
 
@@ -305,17 +316,27 @@ def test_failed_reingest_after_the_parse_keeps_indexed_message(pipeline, corpus_
     p = min(corpus_dir.glob("*.eml"))
     _scan(pipeline, corpus_dir)
     k = pipeline.ingest_file(p, 1).message_key
-    before = _indexed_state(pipeline.store, k)
-    p.write_bytes(b"X-Changed: 1\n" + p.read_bytes())
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(pipeline.store, "replace_chunks", boom)
+    before = _snapshot(pipeline.store, k)
+    p.write_bytes(p.read_bytes().replace(b"Invoice INV", b"Receipt INV"))  # new text, new chunks if committed
+    monkeypatch.setattr(store_module, "recompute_chain_row", _boom)  # the transaction's last write fails
     assert pipeline.ingest_file(p, 2) == IngestOutcome(str(p), k, "failed", "RuntimeError: boom")
     rec = pipeline.store.get_file(str(p))
     assert (rec.message_key, rec.parse_status) == (k, "failed")
-    assert _indexed_state(pipeline.store, k) == before
+    assert _snapshot(pipeline.store, k) == before  # every write of the attempt was rolled back
+
+
+def test_failed_reingest_when_embedder_raises_keeps_vectors(pipeline, corpus_dir, monkeypatch, embedder):
+    p = _first_with(corpus_dir, "docx")
+    _scan(pipeline, corpus_dir)
+    k = pipeline.ingest_file(p, 1).message_key
+    before = _snapshot(pipeline.store, k)
+    assert before[2] and before[3] and all(c[4] == 1 for c in before[1])  # vectors, attachment rows, embedded flags
+    p.write_bytes(b"X-Changed: 1\n" + p.read_bytes())
+    monkeypatch.setattr(pipeline.embedder, "embed", _boom)
+    outcome = pipeline.ingest_file(p, 2)
+    assert (outcome.status, outcome.message_key, outcome.reason) == ("failed", k, "RuntimeError: boom")
+    assert pipeline.store.get_file(str(p)).parse_status == "failed"
+    assert _snapshot(pipeline.store, k) == before
 
 
 def test_reingest_with_a_different_message_drops_the_old_one(pipeline, tmp_path):
@@ -334,20 +355,111 @@ def test_reingest_with_a_different_message_drops_the_old_one(pipeline, tmp_path)
 def test_unexpected_error_marks_file_failed_and_leaves_no_orphan(pipeline, corpus_dir, monkeypatch, caplog):
     p = min(corpus_dir.glob("*.eml"))
     _scan(pipeline, corpus_dir)
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(pipeline.store, "replace_chunks", boom)  # fails after the message row is written
+    events = []
+    pipeline.on_event = events.append
+    monkeypatch.setattr(store_module, "recompute_chain_row", _boom)  # fails inside the write transaction
     with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
         outcome = pipeline.ingest_file(p, 1)
-    assert (outcome.status, outcome.reason) == ("failed", "RuntimeError: boom")
-    assert outcome.message_key == "t000-m00@corpus.example"
+    assert outcome == IngestOutcome(str(p), None, "failed", "RuntimeError: boom")  # first time: no message kept
+    assert events == [{"type": "file_indexed", "path": str(p), "status": "failed", "message_key": None}]
     rec = pipeline.store.get_file(str(p))
     assert (rec.parse_status, rec.status_reason, rec.message_key) == ("failed", "RuntimeError: boom", None)
-    assert pipeline.store.message(outcome.message_key) is None  # the half-written message went with the link
+    assert pipeline.store.message("t000-m00@corpus.example") is None
+    assert pipeline.store.counts()["chunks"] == 0
     assert any(r.levelno == logging.WARNING and "RuntimeError" in r.getMessage() for r in caplog.records)
     assert not any(str(p) in r.getMessage() or "Printer lease" in r.getMessage() for r in caplog.records)
+
+
+def test_os_error_reason_names_no_path(pipeline, tmp_path):
+    missing = tmp_path / "gone" / "vanished.eml"
+    outcome = pipeline.ingest_file(missing, 1)
+    assert (outcome.status, outcome.reason) == ("failed", "No such file or directory")
+
+
+def test_parse_error_reason_is_redacted(pipeline, corpus_dir, monkeypatch):
+    p = min(corpus_dir.glob("*.eml"))
+    _scan(pipeline, corpus_dir)
+    error = ParseError(f"FileNotFoundError: [Errno 2] No such file or directory: '{p}'")
+    monkeypatch.setattr(pipeline.pool, "parse", _raise(error))
+    outcome = pipeline.ingest_file(p, 1)
+    assert outcome.reason.startswith("FileNotFoundError: [Errno 2] No such file or directory: '<path:")
+    assert str(p) not in outcome.reason and str(p) not in pipeline.store.get_file(str(p)).status_reason
+
+
+def test_cache_put_failure_still_indexes(pipeline, corpus_dir, monkeypatch, caplog):
+    def disk_full(doc):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pipeline.cache, "put", disk_full)
+    with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
+        outcome = pipeline.ingest_file(min(corpus_dir.glob("*.eml")), 1)
+    assert outcome.status == "indexed"
+    assert any(r.levelno == logging.WARNING and "OSError" in r.getMessage() for r in caplog.records)
+
+
+def test_ocr_queue_failure_marks_attachment_unavailable(pipeline, corpus_dir, caplog):
+    def locked(payload):
+        raise sqlite3.OperationalError("database is locked")
+
+    pipeline.enqueue_ocr = locked
+    with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
+        outcome = pipeline.ingest_file(_first_with(corpus_dir, "image"), 1)
+    assert (outcome.status, outcome.ocr_jobs) == ("indexed", 0)
+    status = pipeline.store.conn.execute(
+        "SELECT ocr_status FROM attachments WHERE message_key=?", (outcome.message_key,)
+    ).fetchone()[0]
+    assert status == "unavailable"
+    assert any(r.levelno == logging.WARNING and "OperationalError" in r.getMessage() for r in caplog.records)
+
+
+def test_ocr_job_names_the_cache_entry(pipeline_with_queue, corpus_dir, monkeypatch):
+    p = _first_with(corpus_dir, "image")
+    monkeypatch.setattr(pipeline_module, "sha256_file", lambda path: "0" * 64)  # the file changed after it was hashed
+    pipeline_with_queue.ingest_file(p, 1)
+    job = pipeline_with_queue.jobs[0]
+    assert job["sha256"] == sha256_file(p) and pipeline_with_queue.cache.get(job["sha256"]) is not None
+
+
+def test_apply_scan_removes_purged_before_parsing_and_survives_one_failure(pipeline, corpus_dir, monkeypatch, caplog):
+    store = pipeline.store
+    pipeline.apply_scan(reconcile(store, [corpus_dir], 1, 1))
+    victims = [max(corpus_dir.glob("t000-*.eml")), max(corpus_dir.glob("t001-*.eml"))]  # two chains
+    keys = [store.get_file(str(v)).message_key for v in victims]
+    for victim in victims:
+        victim.unlink()
+    pipeline.apply_scan(reconcile(store, [corpus_dir], 2, 2))  # tombstones them
+    (corpus_dir / "new.eml").write_bytes(make_eml_bytes())
+    order = []
+    real_update = pipeline_module.update_chain_row
+
+    def flaky_update(s, chain_id):
+        order.append("chain")
+        if order.count("chain") == 1:
+            raise RuntimeError("chain row")
+        real_update(s, chain_id)
+
+    monkeypatch.setattr(pipeline_module, "update_chain_row", flaky_update)
+    pipeline.on_event = lambda event: order.append(event["type"])
+    result = reconcile(store, [corpus_dir], 3, 3)
+    assert sorted(r.message_key for r in result.purged) == sorted(keys)
+    assert [p.name for p in result.to_parse] == ["new.eml"]
+    with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
+        outcomes = pipeline.apply_scan(result)
+    assert all(store.message(k) is None for k in keys)
+    assert [o.status for o in outcomes] == ["indexed"]
+    assert order == ["chain", "chain", "file_indexed"]  # both removals ran, and before the parse
+    assert any(r.levelno == logging.WARNING and "RuntimeError" in r.getMessage() for r in caplog.records)
+
+
+def test_attach_ocr_text_caps_chunk_text(pipeline, corpus_dir):
+    p = _first_with(corpus_dir, "image")
+    _scan(pipeline, corpus_dir)
+    k = pipeline.ingest_file(p, 1).message_key
+    pipeline.attach_ocr_text(pipeline.store.get_file(str(p)).sha256, 0, "Q7xk9" * 10_000)
+    texts = [r[0] for r in pipeline.store.conn.execute("SELECT text FROM chunks WHERE message_key=? AND part='att:0'", (k,))]
+    assert texts and all(len(t) <= CHUNK_TEXT_MAX_CHARS for t in texts)
+    rec = pipeline.store.get_file(str(p))
+    assert (rec.message_key, rec.parse_status, rec.status_reason) == (k, "indexed", "chunk text truncated")
 
 
 def test_reingest_removes_stale_attachment_parts(pipeline, tmp_path):
@@ -417,7 +529,8 @@ def test_chain_steps_run_without_the_store_lock_held(pipeline, corpus_dir, monke
         return wrapper
 
     monkeypatch.setattr(pipeline_module, "assign_chain", watch(pipeline_module.assign_chain))
-    monkeypatch.setattr(pipeline_module, "update_chain_row", watch(pipeline_module.update_chain_row))
-    monkeypatch.setattr(pipeline.store, "upsert_message", watch(pipeline.store.upsert_message))
-    assert pipeline.ingest_file(min(corpus_dir.glob("*.eml")), 1).status == "indexed"
-    assert held == [("assign_chain", False), ("upsert_message", False), ("update_chain_row", False)]
+    monkeypatch.setattr(pipeline.store, "write_indexed_message", watch(pipeline.store.write_indexed_message))
+    outcome = pipeline.ingest_file(min(corpus_dir.glob("*.eml")), 1)
+    assert outcome.status == "indexed"
+    assert held == [("assign_chain", False), ("write_indexed_message", False)]  # the store takes its own lock
+    assert pipeline.store.conn.execute("SELECT message_count FROM chains").fetchone()[0] == 1

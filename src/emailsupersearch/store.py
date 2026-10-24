@@ -15,12 +15,13 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from emailsupersearch.db.connection import connect
 from emailsupersearch.db.schema import migrate
+from emailsupersearch.index.chains import recompute_chain_row
 from emailsupersearch.ingest.identity import normalize_subject
 from emailsupersearch.types import AttachmentText, ParsedMessage
 
@@ -58,6 +59,17 @@ class ScanUpdate:
     file_id: str | None
     last_seen_scan_id: int
     reparse: bool
+
+
+@dataclass
+class PartWrite:
+    """One part of a message for ``write_indexed_message`` and ``write_part``: its chunks and some embeddings."""
+
+    name: str  # "body" or "att:<ordinal>"
+    ordinal: int | None  # the attachment's ordinal; None for the body
+    chunks: list[ChunkText]
+    embeddings: dict[int, bytes] = field(default_factory=dict)  # position in ``chunks`` -> serialized vector
+    embedded_partial: bool = False  # only some of the attachment's chunks were embedded
 
 
 def _batches(items: Sequence[Any]) -> Iterator[Sequence[Any]]:
@@ -368,44 +380,54 @@ class ProjectStore:
     ) -> None:
         """Write the message row and replace its recipients."""
         with self._lock, self.conn:
-            self.conn.execute(
-                "INSERT INTO messages(message_key, message_id, sent_ts, received_ts, date_source, subject,"
-                " normalized_subject, sender_name, sender_addr, chain_id, chain_depth, body_text, body_html,"
-                " new_text, has_attachments, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(message_key) DO UPDATE SET message_id = excluded.message_id,"
-                " sent_ts = excluded.sent_ts, received_ts = excluded.received_ts, date_source = excluded.date_source,"
-                " subject = excluded.subject, normalized_subject = excluded.normalized_subject,"
-                " sender_name = excluded.sender_name, sender_addr = excluded.sender_addr,"
-                " chain_id = excluded.chain_id, chain_depth = excluded.chain_depth, body_text = excluded.body_text,"
-                " body_html = excluded.body_html, new_text = excluded.new_text,"
-                " has_attachments = excluded.has_attachments, flags = excluded.flags",
-                (
-                    message_key, m.message_id, m.sent_ts, m.received_ts, m.date_source, m.subject,
-                    normalize_subject(m.subject), m.sender_name, m.sender_addr, chain_id, chain_depth,
-                    m.body_text, m.body_html, new_text, int(bool(m.attachments)), "{}",
-                ),
-            )
-            self.conn.execute("DELETE FROM recipients WHERE message_key = ?", (message_key,))
-            self.conn.executemany(
-                "INSERT INTO recipients(message_key, kind, name, addr) VALUES (?, ?, ?, ?)",
-                [(message_key, r.kind, r.name, r.addr) for r in m.recipients],
-            )
+            self._upsert_message(m, message_key, new_text, chain_id, chain_depth)
+
+    def _upsert_message(
+        self, m: ParsedMessage, message_key: str, new_text: str, chain_id: str | None, chain_depth: int
+    ) -> None:
+        """``upsert_message`` for a caller holding the lock with a transaction open."""
+        self.conn.execute(
+            "INSERT INTO messages(message_key, message_id, sent_ts, received_ts, date_source, subject,"
+            " normalized_subject, sender_name, sender_addr, chain_id, chain_depth, body_text, body_html,"
+            " new_text, has_attachments, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(message_key) DO UPDATE SET message_id = excluded.message_id,"
+            " sent_ts = excluded.sent_ts, received_ts = excluded.received_ts, date_source = excluded.date_source,"
+            " subject = excluded.subject, normalized_subject = excluded.normalized_subject,"
+            " sender_name = excluded.sender_name, sender_addr = excluded.sender_addr,"
+            " chain_id = excluded.chain_id, chain_depth = excluded.chain_depth, body_text = excluded.body_text,"
+            " body_html = excluded.body_html, new_text = excluded.new_text,"
+            " has_attachments = excluded.has_attachments, flags = excluded.flags",
+            (
+                message_key, m.message_id, m.sent_ts, m.received_ts, m.date_source, m.subject,
+                normalize_subject(m.subject), m.sender_name, m.sender_addr, chain_id, chain_depth,
+                m.body_text, m.body_html, new_text, int(bool(m.attachments)), "{}",
+            ),
+        )
+        self.conn.execute("DELETE FROM recipients WHERE message_key = ?", (message_key,))
+        self.conn.executemany(
+            "INSERT INTO recipients(message_key, kind, name, addr) VALUES (?, ?, ?, ?)",
+            [(message_key, r.kind, r.name, r.addr) for r in m.recipients],
+        )
 
     def upsert_attachments(self, message_key: str, atts: list[AttachmentText], ocr_status_default: str) -> None:
         """Replace the message's attachment rows; an attachment with pages to OCR starts at ``ocr_status_default``."""
         with self._lock, self.conn:
-            self.conn.execute("DELETE FROM attachments WHERE message_key = ?", (message_key,))
-            self.conn.executemany(
-                "INSERT INTO attachments(message_key, ordinal, filename, mime, size, kind, sha256, extract_status,"
-                " ocr_status, embedded_partial, page_count, text_chars) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?)",
-                [
-                    (
-                        message_key, a.ordinal, a.filename, a.size, a.kind, a.sha256, a.status,
-                        ocr_status_default if a.needs_ocr_pages else "none", a.page_count, len(a.text),
-                    )
-                    for a in atts
-                ],
-            )
+            self._upsert_attachments(message_key, atts, ocr_status_default)
+
+    def _upsert_attachments(self, message_key: str, atts: list[AttachmentText], ocr_status_default: str) -> None:
+        """``upsert_attachments`` for a caller holding the lock with a transaction open."""
+        self.conn.execute("DELETE FROM attachments WHERE message_key = ?", (message_key,))
+        self.conn.executemany(
+            "INSERT INTO attachments(message_key, ordinal, filename, mime, size, kind, sha256, extract_status,"
+            " ocr_status, embedded_partial, page_count, text_chars) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?)",
+            [
+                (
+                    message_key, a.ordinal, a.filename, a.size, a.kind, a.sha256, a.status,
+                    ocr_status_default if a.needs_ocr_pages else "none", a.page_count, len(a.text),
+                )
+                for a in atts
+            ],
+        )
 
     def set_attachment_status(
         self,
@@ -455,22 +477,80 @@ class ProjectStore:
     def replace_chunks(self, message_key: str, part: str, chunks: list[ChunkText]) -> list[int]:
         """Replace one part's chunks (``embedded`` = 0) and return the new rowids in input order."""
         with self._lock, self.conn:
-            old = self.conn.execute("SELECT id FROM chunks WHERE message_key = ? AND part = ?", (message_key, part))
-            self._delete_vectors([r["id"] for r in old])
-            self.conn.execute("DELETE FROM chunks WHERE message_key = ? AND part = ?", (message_key, part))
-            rowids: list[int] = []
-            for c in chunks:
-                cur = self.conn.execute(
-                    "INSERT INTO chunks(message_key, part, idx, text, token_count, embedded) VALUES (?, ?, ?, ?, ?, 0)",
-                    (message_key, part, c.idx, c.text, c.token_count),
-                )
-                rowids.append(cur.lastrowid)
-            return rowids
+            return self._replace_chunks(message_key, part, chunks)
+
+    def _replace_chunks(self, message_key: str, part: str, chunks: list[ChunkText]) -> list[int]:
+        """``replace_chunks`` for a caller holding the lock with a transaction open."""
+        old = self.conn.execute("SELECT id FROM chunks WHERE message_key = ? AND part = ?", (message_key, part))
+        self._delete_vectors([r["id"] for r in old])
+        self.conn.execute("DELETE FROM chunks WHERE message_key = ? AND part = ?", (message_key, part))
+        rowids: list[int] = []
+        for c in chunks:
+            cur = self.conn.execute(
+                "INSERT INTO chunks(message_key, part, idx, text, token_count, embedded) VALUES (?, ?, ?, ?, ?, 0)",
+                (message_key, part, c.idx, c.text, c.token_count),
+            )
+            rowids.append(cur.lastrowid)
+        return rowids
 
     def mark_embedded(self, rowids: list[int]) -> None:
         with self._lock, self.conn:
-            for batch in _batches(rowids):
-                self.conn.execute(f"UPDATE chunks SET embedded = 1 WHERE id IN ({_marks(len(batch))})", tuple(batch))
+            self._mark_embedded(rowids)
+
+    def _mark_embedded(self, rowids: list[int]) -> None:
+        for batch in _batches(rowids):
+            self.conn.execute(f"UPDATE chunks SET embedded = 1 WHERE id IN ({_marks(len(batch))})", tuple(batch))
+
+    def write_indexed_message(
+        self,
+        m: ParsedMessage,
+        message_key: str,
+        new_text: str,
+        chain_id: str,
+        chain_depth: int,
+        attachments: list[AttachmentText],
+        ocr_status_default: str,
+        parts: list[PartWrite],
+        chains: Sequence[str],
+    ) -> list[list[int]]:
+        """Write everything one indexed message is stored as, in one transaction: any error rolls all of it back,
+        so a failed re-index leaves the stored message exactly as it was.
+
+        That is the message row and recipients, the attachment rows, every part's chunks with its embeddings (a
+        part the message no longer has, such as a removed attachment, is cleared), then the rows of ``chains``
+        recomputed. Returns each part's chunk rowids, in the order of ``parts``.
+        """
+        with self._lock, self.conn:
+            self._upsert_message(m, message_key, new_text, chain_id, chain_depth)
+            self._upsert_attachments(message_key, attachments, ocr_status_default)
+            current = {part.name for part in parts}
+            for stale in self.chunk_parts(message_key):
+                if stale not in current:
+                    self._replace_chunks(message_key, stale, [])
+            rowids = [self._write_part(message_key, part) for part in parts]
+            for chain in dict.fromkeys(chains):
+                recompute_chain_row(self.conn, chain)
+        return rowids
+
+    def write_part(self, message_key: str, part: PartWrite) -> list[int]:
+        """Replace one part's chunks with its embeddings in one transaction; returns the new chunk rowids."""
+        with self._lock, self.conn:
+            return self._write_part(message_key, part)
+
+    def _write_part(self, message_key: str, part: PartWrite) -> list[int]:
+        rowids = self._replace_chunks(message_key, part.name, part.chunks)
+        vectors = [(rowids[position], blob) for position, blob in sorted(part.embeddings.items())]
+        if vectors:
+            # chunks_vec is a virtual table with no trigger or upsert; a reused rowid must not collide.
+            self.conn.executemany("DELETE FROM chunks_vec WHERE chunk_rowid = ?", [(rowid,) for rowid, _ in vectors])
+            self.conn.executemany("INSERT INTO chunks_vec(chunk_rowid, embedding) VALUES (?, ?)", vectors)
+            self._mark_embedded([rowid for rowid, _ in vectors])
+        if part.embedded_partial and part.ordinal is not None:
+            self.conn.execute(
+                "UPDATE attachments SET embedded_partial = 1 WHERE message_key = ? AND ordinal = ?",
+                (message_key, part.ordinal),
+            )
+        return rowids
 
     def chunk_rowids(self, message_key: str) -> list[int]:
         with self._lock:
