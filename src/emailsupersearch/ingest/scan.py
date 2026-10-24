@@ -5,22 +5,24 @@ its manifest row. It hashes only new and changed files, recognises a renamed fil
 re-parse), stamps every file it saw, and tombstones the rows it did not see. A tombstone is purged only once the
 next scan confirms the file is still gone. A root that cannot be listed is left alone: nothing under it is
 tombstoned or purged. So is a subdirectory that cannot be listed, and so is a file that cannot be read: an error
-below a root never costs rows. The scan owns the manifest; parsing is the ingest pipeline's job.
+below a root never costs rows. Symlinks and NTFS junctions are not followed (a junction can duplicate a folder or
+loop back on itself). The scan owns the manifest's size, mtime, hash, file id and last-seen columns; it never writes
+back the columns the ingest pipeline owns. Parsing is the pipeline's job.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from emailsupersearch.ingest.parse_cache import sha256_file
-from emailsupersearch.store import FileRecord, ProjectStore
+from emailsupersearch.store import FileRecord, ProjectStore, ScanUpdate
 
 MAIL_SUFFIXES = {".msg", ".eml"}
 
-_FLUSH_EVERY = 500  # manifest rows buffered between writes
+_FLUSH_EVERY = 500  # manifest writes buffered between transactions
 
 
 @dataclass
@@ -38,14 +40,37 @@ class ScanResult:
 
 
 def file_identity(path: Path | str) -> str:
-    """The volume and file index of ``path``, which survive a rename within a volume."""
+    """The volume and file index of ``path``, which normally survive a rename within a volume.
+
+    It is a hint, not a proof. FAT and exFAT volumes report index 0, which ``_usable_identity`` filters out, but on
+    Windows they can also report non-zero, position-derived indexes that change on rename and get reused. The
+    ``:0`` filter is therefore a cheap guard, not a guarantee; a wrong match only costs a re-parse, because the
+    scan compares file hashes before it treats a match as an unchanged rename.
+    """
     st = os.stat(path)
     return f"{st.st_dev}:{st.st_ino}"
 
 
 def _usable_identity(file_id: str) -> bool:
-    """False when the volume reported file index 0 (FAT and exFAT do), which every file would then share."""
+    """False when the volume reported file index 0, which every file would then share (a cheap filter only)."""
     return not file_id.endswith(":0")
+
+
+def _file_id(path: str) -> str | None:
+    """The identity to store for ``path``: ``None`` when the volume gives none that can tell files apart."""
+    identity = file_identity(path)
+    return identity if _usable_identity(identity) else None
+
+
+def _is_gone(path: str) -> bool:
+    """Whether ``path`` is known not to exist. A path that cannot be checked (permission, I/O error) is not gone."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _describe(error: OSError) -> str:
@@ -59,13 +84,14 @@ def _list_dir(directory: str) -> list[os.DirEntry[str]]:
 
 
 class _Reconciler:
-    """One scan's state: the result being built, the manifest rows waiting to be written and the paths seen."""
+    """One scan's state: the result being built, the manifest writes waiting to be flushed and the paths seen."""
 
     def __init__(self, store: ProjectStore, scan_id: int) -> None:
         self.store = store
         self.scan_id = scan_id
         self.result = ScanResult(scan_id)
-        self._queued: list[FileRecord] = []
+        self._inserts: list[FileRecord] = []  # rows for files the manifest has not seen before
+        self._updates: list[ScanUpdate] = []  # scan-owned columns of rows that already exist
         self._seen: set[str] = set()
         self._unreadable: list[str] = []  # subtrees (or entries) that raised OSError; their rows are left as they are
 
@@ -74,8 +100,11 @@ class _Reconciler:
         for root in (os.path.normpath(str(r)) for r in roots):
             try:
                 entries = _list_dir(root)
-            except OSError:
-                self.result.aborted_roots.append(root)
+            except NotADirectoryError:
+                self._abort(root, "NotADirectoryError: not a directory")
+                continue
+            except OSError as e:
+                self._abort(root, _describe(e))
                 continue
             live_roots.append(root)
             for entry in self._walk(entries):
@@ -86,12 +115,18 @@ class _Reconciler:
         self._remove_missing(live_roots, now)
         return self.result
 
+    def _abort(self, root: str, reason: str) -> None:
+        self.result.aborted_roots.append(root)
+        self.result.errors.append((root, reason))
+
     # ---- walking ----
 
     def _walk(self, entries: Iterable[os.DirEntry[str]]) -> Iterator[os.DirEntry[str]]:
         """The mail files among ``entries`` and below them. An entry or folder that raises ``OSError`` is recorded and skipped."""
         for entry in entries:
             try:
+                if entry.is_junction():  # is_dir() is true for a junction, but following it duplicates or loops
+                    continue
                 is_dir = entry.is_dir(follow_symlinks=False)
                 is_mail = (
                     not is_dir and entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in MAIL_SUFFIXES
@@ -128,7 +163,7 @@ class _Reconciler:
             elif (row.size, row.mtime_ns) != (st.st_size, st.st_mtime_ns):
                 self._changed_file(row, st.st_size, st.st_mtime_ns)
             else:
-                self._settle(row)
+                self._decide(path, parse=row.parse_status == "pending")
         except OSError as e:
             self._record_error(path, e)
             if self.store.get_file(path) is None:
@@ -137,65 +172,70 @@ class _Reconciler:
 
     def _new_file(self, path: str, size: int, mtime_ns: int) -> None:
         sha = sha256_file(Path(path))
-        identity = file_identity(path)
-        file_id = identity if _usable_identity(identity) else None
+        file_id = _file_id(path)
         old = self.store.find_by_file_id(file_id) if file_id is not None else None
-        if old is not None and self._moved_away(old):
+        if old is not None and self._is_rename_source(old, path):
             self._rename(old, path, size, mtime_ns, sha, file_id)
             return
-        self._queue(FileRecord(path, size, mtime_ns, sha, file_id, None, "pending", "", self.scan_id, None))
+        self._insert(FileRecord(path, size, mtime_ns, sha, file_id, None, "pending", "", self.scan_id, None))
         self.result.to_parse.append(Path(path))
 
-    def _moved_away(self, old: FileRecord) -> bool:
-        """Whether ``old`` is a row whose file is gone from its path: a rename source, not a second name for a live file."""
+    def _is_rename_source(self, old: FileRecord, path: str) -> bool:
+        """Whether ``old``, the row with the same file identity as the new file at ``path``, is the same file renamed.
+
+        That is so when only the case of the name changed (the old spelling still resolves on a case-insensitive
+        volume), or when the row is missing this scan and its path is gone. A row whose path still exists is a second
+        name for a live file (a hard link), not a rename source.
+        """
+        if os.path.normcase(old.path) == os.path.normcase(path):
+            return True
         missing = old.tombstoned_at is not None or old.last_seen_scan_id < self.scan_id
-        return missing and not os.path.exists(old.path)
+        return missing and _is_gone(old.path)
 
     def _rename(self, old: FileRecord, path: str, size: int, mtime_ns: int, sha: str, file_id: str | None) -> None:
         self.store.move_file(old.path, path)
         self.result.renamed.append((old.path, path))
-        moved = replace(
-            old, path=path, size=size, mtime_ns=mtime_ns, sha256=sha, file_id=file_id,
-            last_seen_scan_id=self.scan_id, tombstoned_at=None,
-        )
-        if sha != old.sha256:
-            self._reparse(moved)
-        else:
-            self._queue(moved)
-            self._settle(moved)
+        self._record_change(old, path, size, mtime_ns, sha, file_id)
 
     def _changed_file(self, row: FileRecord, size: int, mtime_ns: int) -> None:
         """``row``'s size or mtime differs from the file on disk: re-parse only when the bytes differ."""
         sha = sha256_file(Path(row.path))
-        updated = replace(row, size=size, mtime_ns=mtime_ns, sha256=sha)
-        if sha != row.sha256:
-            self._reparse(updated)
-        else:
-            self._queue(updated)
-            self._settle(updated)
+        self._record_change(row, row.path, size, mtime_ns, sha, _file_id(row.path))
 
-    def _reparse(self, rec: FileRecord) -> None:
-        self._queue(replace(rec, parse_status="pending"))
-        self.result.to_parse.append(Path(rec.path))
+    def _record_change(self, row: FileRecord, path: str, size: int, mtime_ns: int, sha: str, file_id: str | None) -> None:
+        """Queue the scan-owned columns of ``row`` (now at ``path``) and decide whether the file needs parsing."""
+        reparse = sha != row.sha256
+        self._update(ScanUpdate(path, size, mtime_ns, sha, file_id, self.scan_id, reparse))
+        self._decide(path, parse=reparse or row.parse_status == "pending")
 
-    def _settle(self, rec: FileRecord) -> None:
-        """``rec``'s file is unchanged: it still needs parsing only when the pipeline has not finished with it."""
-        if rec.parse_status == "pending":
-            self.result.to_parse.append(Path(rec.path))
+    def _decide(self, path: str, parse: bool) -> None:
+        """The file is known: it goes to the pipeline when ``parse``, otherwise it counts as unchanged."""
+        if parse:
+            self.result.to_parse.append(Path(path))
         else:
             self.result.unchanged += 1
 
     # ---- manifest writes ----
 
-    def _queue(self, rec: FileRecord) -> None:
-        self._queued.append(rec)
-        if len(self._queued) >= _FLUSH_EVERY:
+    def _insert(self, rec: FileRecord) -> None:
+        self._inserts.append(rec)
+        self._flush_if_full()
+
+    def _update(self, update: ScanUpdate) -> None:
+        self._updates.append(update)
+        self._flush_if_full()
+
+    def _flush_if_full(self) -> None:
+        if len(self._inserts) + len(self._updates) >= _FLUSH_EVERY:
             self._flush()
 
     def _flush(self) -> None:
-        if self._queued:
-            self.store.upsert_files(self._queued)
-            self._queued = []
+        if self._inserts:
+            self.store.upsert_files(self._inserts)
+            self._inserts = []
+        if self._updates:
+            self.store.update_file_scan_fields(self._updates)
+            self._updates = []
 
     def _remove_missing(self, live_roots: list[str], now: int) -> None:
         """Purge tombstones the earlier scans left, then tombstone this scan's missing files.

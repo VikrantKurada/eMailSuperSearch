@@ -7,7 +7,7 @@ import pytest
 
 from emailsupersearch.db.schema import SCHEMA_VERSION, SchemaTooNew, schema_version
 from emailsupersearch.ingest.chunker import ChunkText
-from emailsupersearch.store import FileRecord, ProjectStore
+from emailsupersearch.store import FileRecord, ProjectStore, ScanUpdate
 from emailsupersearch.types import AttachmentText, ParsedAttachment, Recipient
 
 
@@ -201,6 +201,38 @@ def test_upsert_files_writes_many_rows_in_one_call(tmp_store, corpus_dir):
     assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 2
     tmp_store.upsert_files([])
     assert _count(tmp_store, "SELECT COUNT(*) FROM files") == 2
+
+
+def test_update_file_scan_fields_changes_only_the_scans_columns(tmp_store, corpus_dir):
+    a, b, missing = (os.path.join(str(corpus_dir), name) for name in ("a.eml", "b.eml", "missing.eml"))
+    tmp_store.upsert_file(
+        _rec(a, sha256="old", file_id="f1", message_key="m1", status_reason="ok", last_seen_scan_id=1, tombstoned_at=7)
+    )
+    tmp_store.upsert_file(_rec(b, message_key="m2", parse_status="failed", status_reason="boom"))
+    tmp_store.update_file_scan_fields(
+        [
+            ScanUpdate(a, size=20, mtime_ns=6, sha256="new", file_id="f9", last_seen_scan_id=4, reparse=False),
+            ScanUpdate(b, size=21, mtime_ns=7, sha256="new2", file_id=None, last_seen_scan_id=4, reparse=True),
+            ScanUpdate(missing, 1, 1, "x", None, 4, reparse=True),
+        ]
+    )
+    assert tmp_store.get_file(a) == _rec(
+        a, size=20, mtime_ns=6, sha256="new", file_id="f9", message_key="m1", parse_status="indexed",
+        status_reason="ok", last_seen_scan_id=4, tombstoned_at=7,
+    )
+    assert tmp_store.get_file(b) == _rec(
+        b, size=21, mtime_ns=7, sha256="new2", file_id=None, message_key="m2", parse_status="pending",
+        status_reason="", last_seen_scan_id=4,
+    )
+    assert tmp_store.get_file(missing) is None and _count(tmp_store, "SELECT COUNT(*) FROM files") == 2
+    tmp_store.update_file_scan_fields([])
+
+
+def test_file_id_lookup_uses_an_index(tmp_store):
+    plan = tmp_store.conn.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM files WHERE file_id = ? ORDER BY path LIMIT 1", ("x",)
+    ).fetchall()
+    assert "idx_files_file_id" in " ".join(row[3] for row in plan)
 
 
 def test_move_file_rekeys_the_row_and_replaces_the_target(tmp_store, corpus_dir):

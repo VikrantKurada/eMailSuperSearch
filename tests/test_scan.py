@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 from dataclasses import replace
 
 import pytest
@@ -27,6 +28,27 @@ def _set_status(store, status):
 def _skip_without_file_index(path):
     if os.stat(path).st_ino == 0:
         pytest.skip("this volume reports no file index, so renames cannot be detected")
+
+
+def _case_renamed(path):
+    """Rename ``path`` so that only the case of its name changes (through a temporary name if need be)."""
+    new = path.with_name(path.stem.upper() + path.suffix)
+    try:
+        os.rename(path, new)
+    except OSError:
+        parked = path.with_name(path.name + ".tmp")
+        os.rename(path, parked)
+        os.rename(parked, new)
+    return new
+
+
+def _make_junction(link, target):
+    try:
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, check=False)
+    except OSError:
+        pytest.skip("cmd is not available here")
+    if made.returncode != 0:
+        pytest.skip("a junction cannot be created here")
 
 
 def test_first_scan_lists_all_mail_files(tmp_store, corpus_dir):
@@ -187,6 +209,7 @@ def test_missing_root_aborts_without_tombstones(tmp_store, corpus_dir):
     r = reconcile(tmp_store, [corpus_dir / "gone"], 2, 2)
     assert r.aborted_roots and r.tombstoned == [] and tmp_store.counts()["tombstoned"] == 0
     assert r.aborted_roots == [str(corpus_dir / "gone")] and r.to_parse == [] and r.purged == []
+    assert [path for path, _ in r.errors] == [str(corpus_dir / "gone")] and r.errors[0][1].startswith("FileNotFoundError: ")
 
 
 def test_root_that_is_a_file_aborts(tmp_store, corpus_dir):
@@ -194,6 +217,7 @@ def test_root_that_is_a_file_aborts(tmp_store, corpus_dir):
     not_a_folder = _emls(corpus_dir)[0]
     r = reconcile(tmp_store, [not_a_folder, corpus_dir], 2, 2)
     assert r.aborted_roots == [str(not_a_folder)] and r.tombstoned == []
+    assert r.errors == [(str(not_a_folder), "NotADirectoryError: not a directory")]
     assert tmp_store.counts()["tombstoned"] == 0 and r.unchanged + len(r.to_parse) == len(_emls(corpus_dir))
 
 
@@ -364,6 +388,121 @@ def test_unreadable_file_keeps_its_row(tmp_store, corpus_dir, monkeypatch):
     monkeypatch.undo()
     r3 = reconcile(tmp_store, [corpus_dir], 3, 3)  # readable again: the touched file is checked and found unchanged
     assert r3.errors == [] and r3.to_parse == [] and tmp_store.get_file(str(target)).mtime_ns == later
+
+
+def test_a_junction_to_another_folder_is_not_followed(tmp_store, corpus_dir):
+    real = corpus_dir / "real"
+    real.mkdir()
+    shutil.copy(_emls(corpus_dir)[0], real / "x.eml")
+    link = corpus_dir / "link"
+    _make_junction(link, real)
+    try:
+        r = reconcile(tmp_store, [corpus_dir], 1, 1)
+    finally:
+        os.rmdir(link)  # removes the junction, not its target
+    assert r.to_parse.count(real / "x.eml") == 1 and len(r.to_parse) == len(_emls(corpus_dir)) + 1
+    assert r.errors == [] and all("link" not in p.parts for p in r.to_parse)
+    assert tmp_store.get_file(str(link / "x.eml")) is None
+
+
+def test_a_junction_cycle_is_not_followed(tmp_store, corpus_dir):
+    real = corpus_dir / "real"
+    real.mkdir()
+    shutil.copy(_emls(corpus_dir)[0], real / "x.eml")
+    loop = real / "loop"
+    _make_junction(loop, corpus_dir)  # real\loop leads back to the root
+    try:
+        r = reconcile(tmp_store, [corpus_dir], 1, 1)
+    finally:
+        os.rmdir(loop)
+    assert r.errors == [] and len(r.to_parse) == len(_emls(corpus_dir)) + 1
+    assert tmp_store.counts()["files"] == len(_emls(corpus_dir)) + 1
+
+
+def test_the_scans_update_leaves_the_pipelines_columns_alone(tmp_store, corpus_dir, monkeypatch):
+    target = _emls(corpus_dir)[0]
+    reconcile(tmp_store, [corpus_dir], 1, 1)  # the row is pending and has no message key
+    later = target.stat().st_mtime_ns + 5_000_000_000
+    os.utime(target, ns=(later, later))
+    real_update = tmp_store.update_file_scan_fields
+
+    def update_after_the_pipeline_finished_the_file(updates):
+        with tmp_store.lock, tmp_store.conn:
+            tmp_store.conn.execute(
+                "UPDATE files SET parse_status = 'indexed', message_key = 'k', status_reason = 'ok' WHERE path = ?",
+                (str(target),),
+            )
+        real_update(updates)
+
+    monkeypatch.setattr(tmp_store, "update_file_scan_fields", update_after_the_pipeline_finished_the_file)
+    reconcile(tmp_store, [corpus_dir], 2, 2)
+    row = tmp_store.get_file(str(target))
+    assert (row.parse_status, row.message_key, row.status_reason) == ("indexed", "k", "ok")
+    assert row.mtime_ns == later and row.last_seen_scan_id == 2
+
+
+def test_a_changed_file_goes_back_to_pending_and_loses_its_failure_reason(tmp_store, corpus_dir):
+    target = _emls(corpus_dir)[0]
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    _set_status(tmp_store, "indexed")
+    tmp_store.upsert_file(
+        replace(tmp_store.get_file(str(target)), parse_status="failed", status_reason="boom", message_key="k")
+    )
+    with target.open("ab") as f:
+        f.write(b"\n")
+    r = reconcile(tmp_store, [corpus_dir], 2, 2)
+    row = tmp_store.get_file(str(target))
+    assert r.to_parse == [target]
+    assert (row.parse_status, row.status_reason, row.message_key) == ("pending", "", "k")
+
+
+def test_case_only_rename_is_a_rename(tmp_store, corpus_dir):
+    a = _emls(corpus_dir)[0]
+    _skip_without_file_index(a)
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    _set_status(tmp_store, "indexed")
+    tmp_store.upsert_file(replace(tmp_store.get_file(str(a)), message_key="k1"))
+
+    b = _case_renamed(a)
+    assert b.name != a.name
+    r = reconcile(tmp_store, [corpus_dir], 2, 2)
+    assert r.renamed == [(str(a), str(b))] and r.to_parse == [] and r.tombstoned == [] and r.purged == []
+    assert tmp_store.get_file(str(a)) is None
+    moved = tmp_store.get_file(str(b))
+    assert (moved.message_key, moved.parse_status, moved.tombstoned_at) == ("k1", "indexed", None)
+    assert tmp_store.counts()["files"] == len(_emls(corpus_dir))
+
+
+def test_a_path_that_cannot_be_checked_is_not_gone(corpus_dir, monkeypatch):
+    present = _emls(corpus_dir)[0]
+    assert scan._is_gone(str(corpus_dir / "absent.eml")) and scan._is_gone(str(present / "below-a-file"))
+    assert not scan._is_gone(str(present))
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path) == str(present):
+            raise PermissionError(13, "Access is denied", str(present))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat)
+    assert not scan._is_gone(str(present))
+
+
+def test_changed_file_refreshes_its_file_id(tmp_store, corpus_dir):
+    target = corpus_dir / "fresh.eml"
+    target.write_bytes(b"Subject: a\n\nfirst")
+    _skip_without_file_index(target)
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    _set_status(tmp_store, "indexed")
+    before = tmp_store.get_file(str(target)).file_id
+
+    replacement = corpus_dir / "fresh.tmp"
+    replacement.write_bytes(b"Subject: a\n\nsecond, and longer")
+    os.replace(replacement, target)  # an editor's save: a different file takes over the name
+    r = reconcile(tmp_store, [corpus_dir], 2, 2)
+    row = tmp_store.get_file(str(target))
+    assert r.to_parse == [target] and r.renamed == []
+    assert row.file_id == file_identity(target) and row.file_id != before
 
 
 def test_a_large_scan_is_written_in_batches(tmp_store, corpus_dir):

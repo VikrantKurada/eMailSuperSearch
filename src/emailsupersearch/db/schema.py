@@ -32,6 +32,7 @@ CREATE INDEX idx_recipients_message_key ON recipients (message_key);
 CREATE INDEX idx_chunks_message_key ON chunks (message_key);
 CREATE INDEX idx_files_message_key ON files (message_key);
 CREATE INDEX idx_files_last_seen_scan_id ON files (last_seen_scan_id);
+CREATE INDEX idx_files_file_id ON files (file_id);
 CREATE INDEX idx_jobs_state_priority ON jobs (state, priority);
 CREATE INDEX idx_attachments_sha256 ON attachments (sha256);
 """

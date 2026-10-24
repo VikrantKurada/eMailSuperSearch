@@ -47,6 +47,19 @@ class FileRecord:
     tombstoned_at: int | None
 
 
+@dataclass(frozen=True)
+class ScanUpdate:
+    """What the reconcile scan changes on an existing manifest row; ``reparse`` also sends the row back to ``pending``."""
+
+    path: str
+    size: int
+    mtime_ns: int
+    sha256: str
+    file_id: str | None
+    last_seen_scan_id: int
+    reparse: bool
+
+
 def _batches(items: Sequence[Any]) -> Iterator[Sequence[Any]]:
     for start in range(0, len(items), _BATCH):
         yield items[start : start + _BATCH]
@@ -79,6 +92,15 @@ _UPSERT_FILE = (
     " sha256 = excluded.sha256, file_id = excluded.file_id, message_key = excluded.message_key,"
     " parse_status = excluded.parse_status, status_reason = excluded.status_reason,"
     " last_seen_scan_id = excluded.last_seen_scan_id, tombstoned_at = excluded.tombstoned_at"
+)
+
+
+# The columns the scan owns. message_key, and parse_status and status_reason unless the scan re-parses, belong to
+# the ingest pipeline, which may have changed them since the scan read the row, so the scan never writes them back.
+_UPDATE_SCAN_FIELDS = (
+    "UPDATE files SET size = ?, mtime_ns = ?, sha256 = ?, file_id = ?, last_seen_scan_id = ?,"
+    " parse_status = CASE WHEN ? THEN 'pending' ELSE parse_status END,"
+    " status_reason = CASE WHEN ? THEN '' ELSE status_reason END WHERE path = ?"
 )
 
 
@@ -229,6 +251,20 @@ class ProjectStore:
         """Write many manifest rows in one transaction; the scanner flushes its buffered rows through this."""
         with self._lock, self.conn:
             self.conn.executemany(_UPSERT_FILE, [_file_values(rec) for rec in recs])
+
+    def update_file_scan_fields(self, updates: list[ScanUpdate]) -> None:
+        """Apply the scan's changes to existing rows in one transaction, leaving the pipeline's columns as they are."""
+        with self._lock, self.conn:
+            self.conn.executemany(
+                _UPDATE_SCAN_FIELDS,
+                [
+                    (
+                        u.size, u.mtime_ns, u.sha256, u.file_id, u.last_seen_scan_id,
+                        int(u.reparse), int(u.reparse), u.path,
+                    )
+                    for u in updates
+                ],
+            )
 
     def move_file(self, old_path: str, new_path: str) -> None:
         """Re-key the manifest row at ``old_path`` to ``new_path``, dropping any row already at ``new_path``."""
