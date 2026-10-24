@@ -414,16 +414,17 @@ class ProjectStore:
         extract_status: str | None = None,
         ocr_status: str | None = None,
         embedded_partial: bool | None = None,
+        text_chars: int | None = None,
     ) -> None:
         """Update the given fields of one attachment; fields passed as None keep their value."""
         with self._lock, self.conn:
             self.conn.execute(
                 "UPDATE attachments SET extract_status = COALESCE(?, extract_status),"
-                " ocr_status = COALESCE(?, ocr_status), embedded_partial = COALESCE(?, embedded_partial)"
-                " WHERE message_key = ? AND ordinal = ?",
+                " ocr_status = COALESCE(?, ocr_status), embedded_partial = COALESCE(?, embedded_partial),"
+                " text_chars = COALESCE(?, text_chars) WHERE message_key = ? AND ordinal = ?",
                 (
                     extract_status, ocr_status, None if embedded_partial is None else int(embedded_partial),
-                    message_key, ordinal,
+                    text_chars, message_key, ordinal,
                 ),
             )
 

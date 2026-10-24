@@ -45,6 +45,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def append_ocr_text(existing: str, ocr_text: str) -> str:
+    """An attachment's text once OCR has read its scanned pages: the text layer, a blank line, then the OCR text.
+
+    OCR reads only the pages that had no text layer, so the two are complementary and both are kept.
+    """
+    return f"{existing}\n\n{ocr_text}" if existing else ocr_text
+
+
 def _to_json_value(message: dict[str, Any]) -> None:
     """Make an ``asdict`` message JSON-safe in place: no attachment bytes, the conversation index as hex."""
     if message["conversation_index"] is not None:
@@ -116,7 +124,8 @@ class ParseCache:
             tmp.unlink(missing_ok=True)
 
     def set_ocr_text(self, sha256: str, ordinal: int, text: str) -> None:
-        """Record the OCR result for one attachment: its text, status ``ok`` and no pages left to read.
+        """Record the OCR result for one attachment: the OCR text appended to its text (``append_ocr_text``),
+        status ``ok`` and no pages left to read.
 
         Raises ``KeyError`` when there is no entry for ``sha256`` or it has no such attachment.
         """
@@ -125,7 +134,8 @@ class ParseCache:
             raise KeyError(sha256)
         for attachment in doc.attachments:
             if attachment.ordinal == ordinal:
-                attachment.text, attachment.status, attachment.needs_ocr_pages = text, "ok", []
+                attachment.text = append_ocr_text(attachment.text, text)
+                attachment.status, attachment.needs_ocr_pages = "ok", []
                 break
         else:
             raise KeyError(f"{sha256}: no attachment {ordinal}")

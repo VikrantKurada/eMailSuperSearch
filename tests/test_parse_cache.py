@@ -14,6 +14,10 @@ def test_cache_roundtrip(tmp_path, eml_doc):
 def test_cache_set_ocr_text(tmp_path, eml_doc_with_image):
     c = ParseCache(tmp_path); c.put(eml_doc_with_image); c.set_ocr_text(eml_doc_with_image.sha256, 0, "recovered words")
     a = c.get(eml_doc_with_image.sha256).attachments[0]; assert (a.status, a.text, a.needs_ocr_pages) == ("ok", "recovered words", [])
+def test_cache_set_ocr_text_appends_to_existing_text(tmp_path, eml_doc):
+    c = ParseCache(tmp_path); c.put(eml_doc); layer = eml_doc.attachments[0].text; assert layer
+    c.set_ocr_text(eml_doc.sha256, 0, "recovered words")
+    a = c.get(eml_doc.sha256).attachments[0]; assert (a.status, a.text, a.needs_ocr_pages) == ("ok", layer + "\n\nrecovered words", [])
 
 
 def test_cache_roundtrip_is_lossless(tmp_path, eml_doc):

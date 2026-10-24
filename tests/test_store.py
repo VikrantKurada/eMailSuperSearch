@@ -428,6 +428,9 @@ def test_attachments_upsert_and_status(tmp_store):
     ]
     tmp_store.set_attachment_status("m1", 1, embedded_partial=False)
     assert _count(tmp_store, "SELECT embedded_partial FROM attachments WHERE message_key = 'm1' AND ordinal = 1") == 0
+    tmp_store.set_attachment_status("m1", 1, text_chars=42)
+    rows = tmp_store.conn.execute(sql).fetchall()
+    assert [(r["text_chars"], r["ocr_status"]) for r in rows] == [(len("attachment text"), "none"), (42, "done")]
 
     tmp_store.upsert_attachments("m1", [_att(5)], "pending")  # replaces the key's rows, leaves other keys alone
     rows = tmp_store.conn.execute("SELECT message_key, ordinal FROM attachments ORDER BY message_key").fetchall()

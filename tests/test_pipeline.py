@@ -3,7 +3,7 @@ from email.message import EmailMessage
 
 import numpy as np
 import pytest
-from helpers import LONG_TEXT_30000_WORDS, att_docx
+from helpers import LONG_TEXT_30000_WORDS, att_docx, write_minimal_pdf
 
 from emailsupersearch import logging_setup
 from emailsupersearch.diagnostics.corpus import TOPICS
@@ -21,7 +21,10 @@ from emailsupersearch.ingest.scan import reconcile
 from emailsupersearch.ingest.workers import ParseMemoryExceeded, ParseTimeout
 from emailsupersearch.logging_setup import configure_logging
 
-_DOCX = ("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
+_MIME = {
+    ".docx": ("application", "vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ".pdf": ("application", "pdf"),
+}
 
 
 def _scan(pipeline, folder, scan_id=1):
@@ -38,7 +41,7 @@ def _first_with(corpus_dir, kind):
 
 
 def _eml(folder, name, body, attachment=None, message_id="<built@example.com>"):
-    """Write one message to ``folder / name``; ``attachment`` is ``(filename, docx bytes)``."""
+    """Write one message to ``folder / name``; ``attachment`` is ``(filename, bytes)`` of a .docx or .pdf."""
     msg = EmailMessage()
     msg["Subject"] = "Quarterly supplier report"
     msg["From"] = "Alice Morgan <alice.morgan@example.com>"
@@ -48,7 +51,8 @@ def _eml(folder, name, body, attachment=None, message_id="<built@example.com>"):
     msg.set_content(body)
     if attachment is not None:
         filename, data = attachment
-        msg.add_attachment(data, maintype=_DOCX[0], subtype=_DOCX[1], filename=filename)
+        maintype, subtype = _MIME[filename[filename.rindex("."):]]
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
     path.write_bytes(msg.as_bytes())
@@ -161,7 +165,32 @@ def test_attach_ocr_text_makes_text_searchable(pipeline, corpus_dir):
         "SELECT extract_status, ocr_status FROM attachments WHERE message_key=? AND ordinal=0", (k,)
     ).fetchone()
     assert tuple(status) == ("ok", "ok")
-    assert pipeline.cache.get(sha).attachments[0].text == "zebra crossing report"
+    assert pipeline.cache.get(sha).attachments[0].text == "zebra crossing report"  # no text layer: OCR text alone
+    text_chars = pipeline.store.conn.execute("SELECT text_chars FROM attachments WHERE message_key=?", (k,)).fetchone()[0]
+    assert text_chars == len("zebra crossing report")
+
+
+def test_attach_ocr_text_appends_to_the_text_layer(pipeline, tmp_path):
+    folder = tmp_path / "mixed"
+    pdf = write_minimal_pdf("Page one holds the contract summary.", pages=2)  # page 2 is a scan: no text layer
+    path = _eml(folder, "m.eml", "The signed contract is attached.", ("contract.pdf", pdf))
+    _scan(pipeline, folder)
+    k = pipeline.ingest_file(path, 1).message_key
+    sha = pipeline.store.get_file(str(path)).sha256
+    layer = pipeline.cache.get(sha).attachments[0]
+    assert layer.status == "needs_ocr" and "contract summary" in layer.text
+    pipeline.attach_ocr_text(sha, 0, "zebra crossing report")
+    combined = layer.text + "\n\n" + "zebra crossing report"
+    assert pipeline.cache.get(sha).attachments[0].text == combined
+    att = " ".join(r[0] for r in pipeline.store.conn.execute(
+        "SELECT text FROM chunks WHERE message_key=? AND part='att:0' ORDER BY idx", (k,)
+    ))
+    assert "contract summary" in att and "zebra crossing report" in att
+    att_ids = {r[0] for r in pipeline.store.conn.execute("SELECT id FROM chunks WHERE message_key=? AND part='att:0'", (k,))}
+    for word in ("zebra", "holds"):  # one word from the OCR text, one from the text layer
+        assert {h[0] for h in keyword_search(pipeline.store.conn, word, 10, None)} == att_ids
+    text_chars = pipeline.store.conn.execute("SELECT text_chars FROM attachments WHERE message_key=?", (k,)).fetchone()[0]
+    assert text_chars == len(combined)
 
 
 def test_apply_scan_end_to_end(pipeline, corpus_dir):
@@ -242,15 +271,64 @@ def test_failed_parse_marks_file_failed(pipeline, corpus_dir, monkeypatch, error
     assert pipeline.store.counts()["messages"] == 0
 
 
-def test_failed_reparse_drops_the_message_the_file_held(pipeline, corpus_dir, monkeypatch):
+@pytest.mark.parametrize(
+    "message", ["worker died: BrokenProcessPool('a child process terminated abruptly')", "pool closed"]
+)
+def test_parse_timeout_records_messages_other_than_timeout(pipeline, corpus_dir, monkeypatch, message):
+    p = min(corpus_dir.glob("*.eml"))
+    _scan(pipeline, corpus_dir)
+    monkeypatch.setattr(pipeline.pool, "parse", _raise(ParseTimeout(p, message)))
+    outcome = pipeline.ingest_file(p, 1)
+    assert (outcome.status, outcome.reason) == ("failed", message)
+    assert pipeline.store.get_file(str(p)).status_reason == message
+
+
+def _indexed_state(store, key):
+    return store.message(key)["new_text"], store.chunk_rowids(key), _vec_ids(store)
+
+
+def test_failed_reingest_keeps_indexed_message(pipeline, corpus_dir, monkeypatch):
     p = min(corpus_dir.glob("*.eml"))
     _scan(pipeline, corpus_dir)
     k = pipeline.ingest_file(p, 1).message_key
+    before = _indexed_state(pipeline.store, k)
     p.write_bytes(b"X-Changed: 1\n" + p.read_bytes())  # new bytes, so the cache misses and the pool parses
-    monkeypatch.setattr(pipeline.pool, "parse", _raise(ParseError("broken")))
-    assert pipeline.ingest_file(p, 2).status == "failed"
-    assert pipeline.store.message(k) is None and pipeline.store.chunk_rowids(k) == []
-    assert pipeline.store.conn.execute("SELECT COUNT(*) FROM chains").fetchone()[0] == 0
+    monkeypatch.setattr(pipeline.pool, "parse", _raise(ParseTimeout(p)))
+    assert pipeline.ingest_file(p, 2) == IngestOutcome(str(p), k, "failed", "timeout")
+    rec = pipeline.store.get_file(str(p))
+    assert (rec.message_key, rec.parse_status, rec.status_reason) == (k, "failed", "timeout")
+    assert _indexed_state(pipeline.store, k) == before
+    assert pipeline.store.conn.execute("SELECT SUM(message_count) FROM chains").fetchone()[0] == 1
+
+
+def test_failed_reingest_after_the_parse_keeps_indexed_message(pipeline, corpus_dir, monkeypatch):
+    p = min(corpus_dir.glob("*.eml"))
+    _scan(pipeline, corpus_dir)
+    k = pipeline.ingest_file(p, 1).message_key
+    before = _indexed_state(pipeline.store, k)
+    p.write_bytes(b"X-Changed: 1\n" + p.read_bytes())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline.store, "replace_chunks", boom)
+    assert pipeline.ingest_file(p, 2) == IngestOutcome(str(p), k, "failed", "RuntimeError: boom")
+    rec = pipeline.store.get_file(str(p))
+    assert (rec.message_key, rec.parse_status) == (k, "failed")
+    assert _indexed_state(pipeline.store, k) == before
+
+
+def test_reingest_with_a_different_message_drops_the_old_one(pipeline, tmp_path):
+    store = pipeline.store
+    folder = tmp_path / "swap"
+    path = _eml(folder, "RE Budget.eml", "The first email.", message_id="<first@example.com>")
+    _scan(pipeline, folder)
+    assert pipeline.ingest_file(path, 1).message_key == "first@example.com"
+    _eml(folder, "RE Budget.eml", "A later email saved under the same name.", message_id="<second@example.com>")
+    assert pipeline.ingest_file(path, 2).message_key == "second@example.com"
+    assert store.message("first@example.com") is None and store.chunk_rowids("first@example.com") == []
+    assert store.get_file(str(path)).message_key == "second@example.com"
+    assert store.conn.execute("SELECT SUM(message_count) FROM chains").fetchone()[0] == 1
 
 
 def test_unexpected_error_marks_file_failed_and_leaves_no_orphan(pipeline, corpus_dir, monkeypatch, caplog):

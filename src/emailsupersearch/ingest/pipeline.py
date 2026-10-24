@@ -12,9 +12,10 @@ keeps the chain bookkeeping consistent: the pipeline adds no lock around those s
 
 Every file row the pipeline handles leaves ``pending``, as ``indexed``, ``indexed_partial`` or ``failed`` (a
 duplicate export is ``indexed`` with the reason ``duplicate``), and the row is written only through
-``set_file_parse_result``. A message is kept only while a live file links to it: when a path stops holding a
-message (its file failed, holds another message now, or was purged) and no other live path links that message, the
-message goes, with its chunks and vectors.
+``set_file_parse_result``. A failure never costs an indexed message: a path that already held one keeps the link,
+and the message, its chunks and vectors stay as they were. A message is kept only while a live file links to it:
+when a path stops holding a message (it now holds another one or duplicates another live path, or it was purged)
+and no other live path links that message, the message goes, with its chunks and vectors.
 
 Two guards keep hostile input out of the index. A chunk's text is cut at ``CHUNK_TEXT_MAX_CHARS`` before it is
 stored, keyword-indexed or embedded: a megabyte with no whitespace is one "word" the chunker cannot split. And an
@@ -41,7 +42,7 @@ from emailsupersearch.ingest.chunker import (
 from emailsupersearch.ingest.hygiene import new_text
 from emailsupersearch.ingest.identity import message_key
 from emailsupersearch.ingest.parse import ParseError
-from emailsupersearch.ingest.parse_cache import ParseCache, sha256_file
+from emailsupersearch.ingest.parse_cache import ParseCache, append_ocr_text, sha256_file
 from emailsupersearch.ingest.workers import ParseMemoryExceeded, ParsePool, ParseTimeout
 from emailsupersearch.logging_setup import log_subject
 from emailsupersearch.types import AttachmentText, ParsedDocument, ParsedMessage
@@ -92,6 +93,15 @@ class _Part:
     rowids: list[int] = field(default_factory=list)
 
 
+def _timeout_reason(e: ParseTimeout) -> str:
+    """``timeout`` when the worker ran out of time, else the pool's own message (``pool closed``, ``worker died: ...``).
+
+    The message is ``e.reason``: ``str(e)`` puts the path in front, which a folder named "timeouts" would misread.
+    """
+    msg = e.reason
+    return "timeout" if (not msg or "timeout" in msg.lower() or "timed out" in msg.lower()) else msg[:_REASON_MAX_CHARS]
+
+
 class IngestPipeline:
     """Indexes mail files into one project's store. Not thread-safe: one supervisor thread drives it."""
 
@@ -120,8 +130,10 @@ class IngestPipeline:
     def ingest_file(self, path: Path, scan_id: int) -> IngestOutcome:
         """Index one mail file and record the result on its manifest row; emits a ``file_indexed`` event.
 
-        Never raises: any failure is recorded as ``failed`` with its reason. ``scan_id`` (the scan that queued the
-        file) appears only in DEBUG logs.
+        It expects the manifest row the reconcile scan created for ``path``: without one the message is indexed but
+        nothing is recorded for the file. Never raises: any failure is recorded as ``failed`` with its reason, and a
+        message the path already held stays linked and untouched. ``scan_id`` (the scan that queued the file)
+        appears only in DEBUG logs.
         """
         path = Path(path)
         outcome = self._ingest(path)
@@ -161,13 +173,18 @@ class IngestPipeline:
     def attach_ocr_text(self, sha256: str, ordinal: int, text: str) -> None:
         """Bring in the OCR text of attachment ``ordinal`` of the file whose bytes hash to ``sha256``.
 
-        The parse cache is updated first, so a re-index keeps the text. Then, for every stored message a live file
-        with those bytes links to, the part ``att:<ordinal>`` is re-chunked and re-embedded and the attachment is
-        marked ``ok``. Raises ``KeyError`` when the cache has no such entry or attachment.
+        OCR reads only the pages with no text layer, so its text is appended to the attachment's text layer
+        (``append_ocr_text``). The parse cache is updated first, so a re-index keeps the combined text. Then, for
+        every stored message a live file with those bytes links to, the part ``att:<ordinal>`` is re-chunked and
+        re-embedded from the combined text and the attachment is marked ``ok``. Raises ``KeyError`` when the cache
+        has no such entry or attachment.
         """
+        doc = self.cache.get(sha256)
+        existing = next((a.text for a in doc.attachments if a.ordinal == ordinal), "") if doc is not None else ""
         self.cache.set_ocr_text(sha256, ordinal, text)
+        combined = append_ocr_text(existing, text)
         for key in self.store.message_keys_for_sha256(sha256):
-            self._attach_ocr_part(key, ordinal, text)
+            self._attach_ocr_part(key, ordinal, combined)
 
     # ---- stages ----
 
@@ -183,8 +200,8 @@ class IngestPipeline:
                 log.info("duplicate export of a stored message: %s", log_subject(doc.message.subject))
                 return IngestOutcome(where, key, "skipped_duplicate", "duplicate")
             return self._index(path, sha, doc, key)
-        except ParseTimeout:
-            reason = kind = "timeout"
+        except ParseTimeout as e:
+            reason, kind = _timeout_reason(e), "timeout"
         except ParseMemoryExceeded:
             reason = kind = "memory_cap"
         except ParseError as e:
@@ -342,15 +359,19 @@ class IngestPipeline:
             self._drop_if_orphaned(rec.message_key)
 
     def _fail(self, where: str, key: str | None, reason: str) -> IngestOutcome:
-        """Record a failed file. It holds no message, so a message it held, or half wrote, goes if now orphaned."""
+        """Record a failed file. A message the path already held keeps its link and stays as it was; a message
+        this attempt wrote under another key goes when no live path links it."""
+        kept: str | None = None
         try:
-            self._record(where, None, "failed", reason)
-            if key is not None:
+            rec = self.store.get_file(where)
+            kept = rec.message_key if rec is not None else None
+            self.store.set_file_parse_result(where, kept, "failed", reason)
+            if key is not None and key != kept:
                 self._drop_if_orphaned(key)
         except Exception as e:
             log.warning("could not record a failed file: %s", type(e).__name__)
             log.debug("recording the failure of %s failed", where, exc_info=True)
-        return IngestOutcome(where, key, "failed", reason)
+        return IngestOutcome(where, kept if kept is not None else key, "failed", reason)
 
     def _drop_if_orphaned(self, key: str) -> None:
         """Delete the message (chunks and vectors too) when no live path links it, then recompute its chain row."""
@@ -375,7 +396,7 @@ class IngestPipeline:
         part = self._part(f"att:{ordinal}", ordinal, text, line)
         part.rowids = self.store.replace_chunks(key, part.name, part.chunks)
         self._embed(key, [part])
-        self.store.set_attachment_status(key, ordinal, extract_status="ok", ocr_status="ok")
+        self.store.set_attachment_status(key, ordinal, extract_status="ok", ocr_status="ok", text_chars=len(text))
 
     def _emit(self, event: dict) -> None:
         if self.on_event is None:
