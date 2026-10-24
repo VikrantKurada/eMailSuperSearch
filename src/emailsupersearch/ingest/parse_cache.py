@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from emailsupersearch.types import (
 )
 
 _READ_BLOCK_BYTES = 1024 * 1024
+_REPLACE_ATTEMPTS = 10  # a reader holding the entry open makes the rename fail with PermissionError on Windows
+_REPLACE_RETRY_S = 0.02
 
 # Per class, the fields that hold other dataclasses: (their class, whether the field is a list of them).
 _CHILDREN: dict[type, dict[str, tuple[type, bool]]] = {
@@ -83,7 +86,15 @@ class ParseCache:
 
     def put(self, doc: ParsedDocument) -> None:
         """Store a document. The file is written whole under a temporary name and renamed into place,
-        so a reader never sees half a file."""
+        so a reader never sees half a file.
+
+        On Windows the rename fails while a reader has the entry open, so it is retried. If it keeps failing and
+        the entry already exists, that is left as it is: the entry is named by the hash of the mail file, so a
+        document parsed from the same file is interchangeable with it.
+        """
+        self._store(doc, keep_existing_on_conflict=True)
+
+    def _store(self, doc: ParsedDocument, *, keep_existing_on_conflict: bool) -> None:
         data = dataclasses.asdict(doc)
         _to_json_value(data["message"])
         target = self._path(doc.sha256)
@@ -91,7 +102,16 @@ class ParseCache:
         tmp = target.with_name(f"{target.name}.{os.getpid()}-{threading.get_ident()}.tmp")
         try:
             tmp.write_text(json.dumps(data), encoding="utf-8")
-            os.replace(tmp, target)
+            for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(tmp, target)
+                    return
+                except PermissionError:
+                    if attempt == _REPLACE_ATTEMPTS:
+                        if keep_existing_on_conflict and target.exists():
+                            return
+                        raise
+                    time.sleep(_REPLACE_RETRY_S)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -109,4 +129,4 @@ class ParseCache:
                 break
         else:
             raise KeyError(f"{sha256}: no attachment {ordinal}")
-        self.put(doc)
+        self._store(doc, keep_existing_on_conflict=False)  # new content: it must replace the entry

@@ -1,7 +1,9 @@
 import json
+import threading
 
 import pytest
 
+from emailsupersearch.ingest import parse_cache
 from emailsupersearch.ingest.parse_cache import ParseCache, sha256_file
 from emailsupersearch.types import ParsedAttachment, ParsedDocument
 
@@ -65,3 +67,68 @@ def test_sha256_file_is_the_hash_of_the_bytes(tmp_path):
     p = tmp_path / "f.bin"
     p.write_bytes(b"abc")
     assert sha256_file(p) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+
+def test_cache_put_survives_concurrent_reader(tmp_path, eml_doc):
+    c = ParseCache(tmp_path / "cache")
+    c.put(eml_doc)
+    stop = threading.Event()
+    failures = []
+
+    def read():
+        while not stop.is_set():
+            try:
+                c.get(eml_doc.sha256)
+            except BaseException as e:  # noqa: BLE001 - the thread hands whatever went wrong to the test
+                failures.append(e)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    try:
+        for _ in range(200):
+            c.put(eml_doc)
+    finally:
+        stop.set()
+        reader.join()
+    assert failures == []
+    assert c.get(eml_doc.sha256) == eml_doc
+    assert [p.name for p in (tmp_path / "cache").iterdir()] == [f"{eml_doc.sha256}.json"]
+
+
+@pytest.fixture
+def lock_rename(monkeypatch):
+    """A function that, once called, makes every rename into place fail as a Windows reader holding the target does."""
+
+    def lock():
+        def refuse(src, dst):
+            raise PermissionError(13, "in use")
+
+        monkeypatch.setattr(parse_cache, "_REPLACE_RETRY_S", 0)
+        monkeypatch.setattr(parse_cache.os, "replace", refuse)
+
+    return lock
+
+
+def test_cache_put_keeps_an_existing_entry_when_the_rename_keeps_failing(tmp_path, eml_doc, lock_rename):
+    c = ParseCache(tmp_path / "cache")
+    c.put(eml_doc)
+    lock_rename()
+    c.put(eml_doc)
+    assert c.get(eml_doc.sha256) == eml_doc
+    assert [p.name for p in (tmp_path / "cache").iterdir()] == [f"{eml_doc.sha256}.json"]  # the temp file is gone
+
+
+def test_cache_put_raises_when_there_is_no_entry_to_fall_back_on(tmp_path, eml_doc, lock_rename):
+    c = ParseCache(tmp_path / "cache")
+    lock_rename()
+    with pytest.raises(PermissionError):
+        c.put(eml_doc)
+    assert list((tmp_path / "cache").iterdir()) == []
+
+
+def test_cache_set_ocr_text_is_not_dropped_when_the_rename_keeps_failing(tmp_path, eml_doc_with_image, lock_rename):
+    c = ParseCache(tmp_path / "cache")
+    c.put(eml_doc_with_image)
+    lock_rename()
+    with pytest.raises(PermissionError):
+        c.set_ocr_text(eml_doc_with_image.sha256, 0, "recovered words")

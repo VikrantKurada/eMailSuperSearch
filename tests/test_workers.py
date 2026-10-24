@@ -1,3 +1,6 @@
+import sys
+import threading
+import time
 from email.message import EmailMessage
 
 import pytest
@@ -79,5 +82,66 @@ def test_parse_pool_recovers_from_a_dead_worker(tmp_path):
             pool.parse(p)
         assert caught.value.path == p and "worker died" in caught.value.reason
         assert pool.parse(p).message.subject
+    finally:
+        pool.close()
+
+
+def test_parse_document_reports_a_missing_file_as_a_parse_error(tmp_path):
+    with pytest.raises(ParseError, match="FileNotFoundError"):
+        parse_document(tmp_path / "missing.eml")
+
+
+def test_parse_pool_reports_a_missing_file_as_a_parse_error(tmp_path):
+    pool = ParsePool()
+    try:
+        with pytest.raises(ParseError, match="FileNotFoundError"):
+            pool.parse(tmp_path / "missing.eml")
+        assert pool.parse(generate(tmp_path, 1, seed=1)[0]).message.subject
+    finally:
+        pool.close()
+
+
+def test_close_during_hung_job_returns_promptly(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers, "_worker_fn", workers._sleep_forever_for_tests)
+    pool = ParsePool(timeout_s=30)
+    outcome = []
+
+    def run():
+        try:
+            pool.parse(tmp_path / "any.eml")
+        except BaseException as e:  # noqa: BLE001 - the thread hands whatever ended it to the test
+            outcome.append(e)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.5)
+    started = time.monotonic()
+    pool.close()
+    assert time.monotonic() - started < 5
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], ParseTimeout) and outcome[0].reason == "pool closed"
+
+
+def test_a_closed_pool_refuses_work_and_closes_twice(tmp_path):
+    pool = ParsePool()
+    pool.close()
+    pool.close()
+    with pytest.raises(ParseTimeout) as caught:
+        pool.parse(generate(tmp_path, 1, seed=1)[0])
+    assert caught.value.reason == "pool closed"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the running cap is a Windows job object")
+def test_memory_cap_is_enforced_during_the_parse(tmp_path, monkeypatch):
+    pool = ParsePool(max_rss_mb=128, timeout_s=30)
+    monkeypatch.setattr(workers, "_worker_fn", workers._allocate_forever_for_tests)  # no check of its own
+    started = time.monotonic()
+    try:
+        with pytest.raises(ParseMemoryExceeded):
+            pool.parse(tmp_path / "any.eml")
+        assert time.monotonic() - started < 10  # the 30 s timeout did not have to end it
+        monkeypatch.undo()
+        assert pool.parse(generate(tmp_path, 1, seed=1)[0]).message.subject
     finally:
         pool.close()
