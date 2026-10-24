@@ -13,7 +13,7 @@ from emailsupersearch.cli import main
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.jobs import supervisor as supervisor_module
-from emailsupersearch.jobs.queue import pending_counts
+from emailsupersearch.jobs.queue import enqueue, pending_counts
 from emailsupersearch.jobs.supervisor import build_project_supervisor
 
 
@@ -156,8 +156,18 @@ def test_stop_is_idempotent_and_closes_store(sup):
     _assert_closed(sup.store)
     with pytest.raises(RuntimeError):
         sup.store.read_conn()
+    assert sup.store.closed
     status = sup.status()  # the last status known, marked closed
     assert (status.state, status.last_error) == ("idle", "closed") and status.files_total > 0
+
+
+def test_status_raises_store_errors_while_the_store_is_open(sup, monkeypatch):
+    def broken() -> dict:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sup.store, "counts", broken)
+    with pytest.raises(RuntimeError, match="boom"):
+        sup.status()
 
 
 def test_stop_during_long_scan_returns_quickly(sup, monkeypatch):
@@ -187,6 +197,8 @@ def test_stop_from_an_event_callback_closes_on_exit(sup):
     sup.start()
     wait_until(lambda: not _supervisor_threads(), 30)
     _assert_closed(sup.store)
+    # The stop came before the reconcile ended, so nothing was parsed (the rows stay pending for the next start).
+    assert not [e for e in sup.events_for_tests if e["type"] == "file_indexed"]
 
 
 def test_watcher_stop_from_on_change_does_not_wait(tmp_path, caplog):
@@ -268,6 +280,26 @@ def test_ocr_failure_timeout_is_retried(sup_with_ocr, monkeypatch):
     sup_with_ocr.stop()
     # The timeout put the job back in the queue with one attempt counted; the second run completed it.
     assert jobs == [("done", 1, "timeout")] and len(calls) == 2
+
+
+def test_dropped_rescan_still_drains_ocr(sup_slow, monkeypatch):
+    class StubRunner:
+        def run(self, payload: dict, language: str) -> str:
+            return "stub text"
+
+    attached: list[tuple] = []
+    sup_slow.ocr_runner = StubRunner()
+    monkeypatch.setattr(sup_slow.pipeline, "attach_ocr_text", lambda *args: attached.append(args))
+    with sup_slow.store.lock:
+        enqueue(sup_slow.store.conn, "ocr", {"path": "x", "sha256": "abc", "ordinal": 0, "pages": [0]})
+    # A timer scan, then a rescan that the scan serves: each scan's drain stops for the command behind it, and the
+    # rescan is dropped when it comes up. The timer (3600 s) cannot fire during the test.
+    sup_slow._commands.put(("scan", None))
+    sup_slow.request_rescan()
+    sup_slow.start()
+    wait_until(lambda: pending_counts(sup_slow.store.read_conn())["done"] == 1, 30)
+    assert attached == [("abc", 0, "stub text")] and _scan_id(sup_slow) == 2  # the rescan ran no scan
+    sup_slow.stop()
 
 
 def test_request_rescan_coalesces(sup):

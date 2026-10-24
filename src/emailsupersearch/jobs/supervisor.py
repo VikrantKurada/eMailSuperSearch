@@ -258,7 +258,9 @@ class ProjectSupervisor:
                 metadata_only=counts["metadata_only"],
                 last_error=self._last_error,
             )
-        except (sqlite3.ProgrammingError, RuntimeError):  # the store is closed, or closing
+        except (sqlite3.ProgrammingError, RuntimeError):
+            if not self.store.closed:
+                raise
             last = self._last_status or SyncStatus(self.project_id, "idle", None, 0, 0, 0, 0, None)
             return dataclasses.replace(last, state="idle", last_error="closed")
         self._last_status = status
@@ -288,6 +290,8 @@ class ProjectSupervisor:
                 if command in ("scan", "rescan"):
                     if self._scan_wanted(command):
                         self._guard(command, self._scan_and_drain)
+                    else:  # this waiting rescan cut the last scan's drain short; drain now instead
+                        self._guard("ocr", self._drain_ocr)
                 elif command == "ocr":
                     self._guard(command, self._drain_ocr)
         finally:
@@ -405,6 +409,9 @@ class ProjectSupervisor:
         True when all of it was applied. The first slice carries the renames and purges. Files a stop leaves
         unreached keep their ``pending`` row, so the next reconcile queues them again."""
         todo = result.to_parse
+        if self._stop_event.is_set():  # stopped during the reconcile: keep its renames and purges, parse nothing
+            self.pipeline.apply_scan(dataclasses.replace(result, to_parse=[]))
+            return False
         self.pipeline.apply_scan(dataclasses.replace(result, to_parse=todo[:_APPLY_SLICE]))
         for start in range(_APPLY_SLICE, len(todo), _APPLY_SLICE):
             if self._stop_event.is_set():

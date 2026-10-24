@@ -302,7 +302,9 @@ def test_close_releases_file(tmp_path):
     worker = threading.Thread(target=lambda: store.read_conn().execute("SELECT 1").fetchall())
     worker.start()
     worker.join()
+    assert not store.closed
     store.close()
+    assert store.closed
     (project_dir / "project.sqlite").unlink()
     assert not (project_dir / "project.sqlite").exists()
     store.close()  # closing twice is harmless
