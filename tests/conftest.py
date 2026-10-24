@@ -95,3 +95,25 @@ def msg_fixtures():
     if not found:
         pytest.skip("run scripts/fetch_fixtures.py")
     return found
+
+
+@pytest.fixture
+def eml_doc(tmp_path):
+    """The parsed last message of a one-thread corpus: it carries the PDF attachment."""
+    from emailsupersearch.diagnostics.corpus import generate
+    from emailsupersearch.ingest.workers import parse_document
+
+    return parse_document(generate(tmp_path / "c", 1, seed=1)[-1])
+
+
+@pytest.fixture
+def eml_doc_with_image(tmp_path):
+    """The parsed message of a four-thread corpus whose attachment is an image (thread 3's last file)."""
+    from emailsupersearch.diagnostics.corpus import generate
+    from emailsupersearch.ingest.workers import parse_document
+
+    for path in reversed(generate(tmp_path / "c4", 4, seed=3)):
+        doc = parse_document(path)
+        if any(a.kind == "image" for a in doc.attachments):
+            return doc
+    raise AssertionError("the corpus has no message with an image attachment")
