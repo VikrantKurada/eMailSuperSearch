@@ -102,16 +102,23 @@ def test_knn_small_candidate_set_matches_brute_force(index):
     assert [rowid for rowid, _ in hits] == brute_force(vecs, query, candidates, 5)
 
 
-def test_knn_with_many_candidates_uses_temp_table(index, conn):
+def test_knn_with_many_candidates_matches_brute_force(index, conn):
     vecs = unit_vectors(1001)
     index.upsert([(i + 1, vecs[i]) for i in range(1001)])
     candidates = list(range(2, 1002))  # 1000 candidates; rowid 1, the exact match, is excluded
     hits = index.knn(vecs[0], k=5, candidates=candidates)
     assert [rowid for rowid, _ in hits] == brute_force(vecs, vecs[0], candidates, 5)
-    assert conn.execute("SELECT count(*) FROM vec_candidates").fetchone()[0] == 1000
-    index.knn(vecs[0], k=5, candidates=candidates[:950])  # the temp table is refilled, not appended to
-    assert conn.execute("SELECT count(*) FROM vec_candidates").fetchone()[0] == 950
     assert not conn.in_transaction
+
+
+def test_knn_with_many_candidates_works_on_a_read_only_connection(tmp_store):
+    vecs = unit_vectors(1001)
+    VectorIndex(tmp_store.conn).upsert([(i + 1, vecs[i]) for i in range(1001)])
+    reader = tmp_store.read_conn()  # PRAGMA query_only=1: it refuses writes, TEMP tables included
+    candidates = list(range(2, 1002))
+    hits = VectorIndex(reader).knn(vecs[0], k=5, candidates=candidates)
+    assert [rowid for rowid, _ in hits] == brute_force(vecs, vecs[0], candidates, 5)
+    assert not reader.in_transaction
 
 
 def test_knn_tolerates_duplicate_candidates_beyond_the_inline_limit(index):
@@ -202,7 +209,7 @@ def test_knn_tolerates_null_distance(index, conn):
         "SELECT distance FROM chunks_vec WHERE embedding MATCH ? AND k = 4 AND chunk_rowid = 99",
         (sqlite_vec.serialize_float32(vecs[0].tolist()),),
     ).fetchone()[0] is None  # sqlite-vec reports NULL for it, and sorts NULL ahead of real distances
-    for candidates in (None, [1, 2, 3, 99], [1, 2, 3, 99] * 300):  # inline, temp-table paths too
+    for candidates in (None, [1, 2, 3, 99], [1, 2, 3, 99] * 300):  # the inline and json_each paths too
         hits = index.knn(vecs[0], k=10, candidates=candidates)
         assert hits[0][0] == 1 and hits[-1] == (99, 0.0)
         assert len(hits) == 4 and [s for _, s in hits] == sorted((s for _, s in hits), reverse=True)

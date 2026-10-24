@@ -1,17 +1,14 @@
 """Chunk embeddings in a sqlite-vec ``vec0`` table, searchable with a candidate pre-filter."""
 
 import sqlite3
-import threading
 
 import numpy as np
 import sqlite_vec
 
-# Above this many candidates the rowids go through a temp table instead of bound parameters.
-INLINE_CANDIDATE_LIMIT = 900
+from emailsupersearch.index.candidates import candidate_clause
+
 # sqlite-vec rejects a KNN query with a larger ``k``.
 MAX_K = 4096
-
-_CREATE_CANDIDATES = "CREATE TEMP TABLE IF NOT EXISTS vec_candidates(rowid INTEGER PRIMARY KEY)"
 
 
 def _blob(vector: np.ndarray, dim: int) -> bytes:
@@ -35,8 +32,6 @@ class VectorIndex:
     def __init__(self, conn: sqlite3.Connection, dim: int = 384) -> None:
         self.conn = conn
         self.dim = dim
-        # The temp candidate table is per connection, so concurrent large-candidate searches must not interleave.
-        self._candidates_lock = threading.Lock()
 
     def upsert(self, rows: list[tuple[int, np.ndarray]]) -> None:
         """Store each vector under its chunk rowid, replacing any existing one, in one transaction."""
@@ -63,24 +58,12 @@ class VectorIndex:
         sql = "SELECT chunk_rowid, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ?"
         if candidates is None:
             rows = self.conn.execute(sql + " ORDER BY distance", (blob, k)).fetchall()
-        elif len(candidates) <= INLINE_CANDIDATE_LIMIT:
-            marks = ",".join("?" * len(candidates))
-            params = (blob, k, *(int(c) for c in candidates))
-            rows = self.conn.execute(f"{sql} AND chunk_rowid IN ({marks}) ORDER BY distance", params).fetchall()
         else:
-            rows = self._knn_via_temp_table(sql, blob, k, candidates)
+            clause, params = candidate_clause("chunk_rowid", candidates)
+            rows = self.conn.execute(f"{sql} AND {clause} ORDER BY distance", (blob, k, *params)).fetchall()
         hits = [(int(rowid), _similarity(distance)) for rowid, distance in rows]
         hits.sort(key=lambda hit: -hit[1])  # SQLite orders a NULL distance first; a corrupt row must not outrank real hits
         return hits
-
-    def _knn_via_temp_table(self, sql: str, blob: bytes, k: int, candidates: list[int]) -> list[sqlite3.Row]:
-        with self._candidates_lock, self.conn:  # leaving the block commits, so no read snapshot lingers
-            self.conn.execute(_CREATE_CANDIDATES)
-            self.conn.execute("DELETE FROM vec_candidates")
-            self.conn.executemany("INSERT OR IGNORE INTO vec_candidates(rowid) VALUES (?)", [(int(c),) for c in candidates])
-            return self.conn.execute(
-                f"{sql} AND chunk_rowid IN (SELECT rowid FROM vec_candidates) ORDER BY distance", (blob, k)
-            ).fetchall()
 
     def count(self) -> int:
         return int(self.conn.execute("SELECT count(*) FROM chunks_vec").fetchone()[0])
