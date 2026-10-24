@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import sqlite_vec
 
 from emailsupersearch.db.connection import connect
 from emailsupersearch.db.schema import migrate
@@ -47,6 +48,15 @@ def test_upsert_rejects_wrong_dimension(index):
     with pytest.raises(ValueError):
         index.upsert([(1, np.zeros(DIM - 1, dtype=np.float32))])
     assert index.count() == 0
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_upsert_rejects_non_finite_vector(index, bad):
+    vec = unit_vectors(1)[0]
+    vec[17] = bad
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        index.upsert([(1, unit_vectors(1, seed=1)[0]), (2, vec)])
+    assert index.count() == 0  # the valid row in the same batch is not written either
 
 
 def test_knn_returns_nearest_first(index):
@@ -169,3 +179,30 @@ def test_rowids_may_be_numpy_integers(index):
     assert [rowid for rowid, _ in index.knn(vecs[0], k=2, candidates=[5, 6])] == [5, 6]
     index.delete([np.int64(5)])
     assert index.count() == 1
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_knn_rejects_non_finite_query(index, bad):
+    vecs = unit_vectors(2)
+    index.upsert([(1, vecs[0]), (2, vecs[1])])
+    query = vecs[0].copy()
+    query[3] = bad
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        index.knn(query, k=2, candidates=None)
+
+
+def test_knn_tolerates_null_distance(index, conn):
+    vecs = unit_vectors(4)
+    index.upsert([(1, vecs[0]), (2, vecs[1]), (3, vecs[2])])
+    # upsert refuses NaN, so a corrupt row can only come from outside it; write one straight into the table.
+    nan_blob = sqlite_vec.serialize_float32([float("nan")] * DIM)
+    with conn:
+        conn.execute("INSERT INTO chunks_vec(chunk_rowid, embedding) VALUES (99, ?)", (nan_blob,))
+    assert conn.execute(
+        "SELECT distance FROM chunks_vec WHERE embedding MATCH ? AND k = 4 AND chunk_rowid = 99",
+        (sqlite_vec.serialize_float32(vecs[0].tolist()),),
+    ).fetchone()[0] is None  # sqlite-vec reports NULL for it, and sorts NULL ahead of real distances
+    for candidates in (None, [1, 2, 3, 99], [1, 2, 3, 99] * 300):  # inline, temp-table paths too
+        hits = index.knn(vecs[0], k=10, candidates=candidates)
+        assert hits[0][0] == 1 and hits[-1] == (99, 0.0)
+        assert len(hits) == 4 and [s for _, s in hits] == sorted((s for _, s in hits), reverse=True)

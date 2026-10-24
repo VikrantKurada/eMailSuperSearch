@@ -17,7 +17,16 @@ _CREATE_CANDIDATES = "CREATE TEMP TABLE IF NOT EXISTS vec_candidates(rowid INTEG
 def _blob(vector: np.ndarray, dim: int) -> bytes:
     if vector.shape != (dim,):
         raise ValueError(f"expected a vector of shape ({dim},), got {vector.shape}")
+    if not np.isfinite(vector).all():
+        raise ValueError("vector contains NaN or infinity")
     return sqlite_vec.serialize_float32(vector.astype(np.float32).tolist())
+
+
+def _similarity(distance: float | None) -> float:
+    """``1 - distance / 2`` clamped to [0, 1]; sqlite-vec reports a NULL distance for a row holding NaN."""
+    if distance is None:
+        return 0.0
+    return min(1.0, max(0.0, 1.0 - distance / 2.0))
 
 
 class VectorIndex:
@@ -60,7 +69,9 @@ class VectorIndex:
             rows = self.conn.execute(f"{sql} AND chunk_rowid IN ({marks}) ORDER BY distance", params).fetchall()
         else:
             rows = self._knn_via_temp_table(sql, blob, k, candidates)
-        return [(int(rowid), min(1.0, max(0.0, 1.0 - distance / 2.0))) for rowid, distance in rows]
+        hits = [(int(rowid), _similarity(distance)) for rowid, distance in rows]
+        hits.sort(key=lambda hit: -hit[1])  # SQLite orders a NULL distance first; a corrupt row must not outrank real hits
+        return hits
 
     def _knn_via_temp_table(self, sql: str, blob: bytes, k: int, candidates: list[int]) -> list[sqlite3.Row]:
         with self._candidates_lock, self.conn:  # leaving the block commits, so no read snapshot lingers
