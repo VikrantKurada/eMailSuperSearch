@@ -7,7 +7,6 @@ holds numbers and notes only, never message text, so it is safe to paste back.
 
 from __future__ import annotations
 
-import logging
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -28,8 +27,6 @@ from emailsupersearch.ingest.chunker import Chunker, context_line_for
 from emailsupersearch.ingest.parse import ParseError
 from emailsupersearch.ingest.workers import _peak_working_set_bytes, parse_document
 from emailsupersearch.types import ParsedDocument
-
-log = logging.getLogger(__name__)
 
 MAIL_SUFFIXES = {".eml", ".msg"}
 EMBED_BATCH = 32
@@ -67,8 +64,7 @@ def _parse_all(files: list[Path], notes: list[str]) -> tuple[list[ParsedDocument
     for path in files:
         try:
             docs.append(parse_document(path))
-        except ParseError as e:
-            log.warning("bench: %s did not parse: %s", path.name, e)
+        except ParseError:  # its text can hold a local path and the report is pasted back, so nothing is logged
             failed += 1
     elapsed = time.perf_counter() - started
     if failed:
@@ -185,6 +181,8 @@ def run_bench(corpus_dir: Path | None, n_threads: int = 50, seed: int = 1, vecto
     otherwise every ``.eml`` and ``.msg`` under ``corpus_dir`` is used. Without the models package the
     embedding and nearest-neighbour fields are None and ``notes`` says why.
     """
+    if vectors < 1:
+        raise ValueError(f"vectors must be at least 1, got {vectors}")
     notes: list[str] = []
     if corpus_dir is not None:
         return _measure(Path(corpus_dir), vectors, notes)

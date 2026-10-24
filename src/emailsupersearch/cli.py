@@ -86,9 +86,21 @@ def _bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive number")
+    return value
+
+
 def _configure_bench(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--corpus", type=Path, help="folder of .eml/.msg files to time instead of the synthetic corpus")
-    parser.add_argument("--vectors", type=int, default=300_000, help="rows in the nearest-neighbour test (default 300000)")
+    parser.add_argument(
+        "--vectors", type=_positive_int, default=300_000, help="rows in the nearest-neighbour test (default 300000)"
+    )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
 
 
