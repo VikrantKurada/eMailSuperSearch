@@ -43,7 +43,7 @@ def test_first_scan_lists_all_mail_files(tmp_store, corpus_dir):
 
 def test_unchanged_second_scan_parses_nothing(tmp_store, corpus_dir):
     reconcile(tmp_store, [corpus_dir], 1, 1)
-    _set_status(tmp_store, "indexed")
+    _set_status(tmp_store, "indexed")  # the ingest pipeline owns the pending -> parsed transition; stand in for it
     r2 = reconcile(tmp_store, [corpus_dir], 2, 2)
     assert r2.to_parse == [] and r2.unchanged == len(_emls(corpus_dir))
     assert r2.tombstoned == [] and r2.renamed == []
@@ -262,6 +262,30 @@ def test_aborted_root_keeps_old_tombstones(tmp_store, corpus_dir):
     assert r.purged == [] and tmp_store.counts()["tombstoned"] == 1
 
 
+def _deny_scandir(monkeypatch, directory):
+    """Make listing ``directory`` (and only it) raise PermissionError."""
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if os.fspath(path) == str(directory):
+            raise PermissionError(13, "Access is denied", str(directory))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
+def _deny_reading(monkeypatch, file):
+    """Make hashing ``file`` (and only it) raise PermissionError."""
+    real_sha = scan.sha256_file
+
+    def sha256_file_or_fail(path):
+        if str(path) == str(file):
+            raise PermissionError(13, "The process cannot access the file", str(file))
+        return real_sha(path)
+
+    monkeypatch.setattr(scan, "sha256_file", sha256_file_or_fail)
+
+
 def test_errors_in_subdirectory_do_not_abort_root(tmp_store, corpus_dir, monkeypatch):
     locked = corpus_dir / "locked"
     open_dir = corpus_dir / "open"
@@ -269,14 +293,7 @@ def test_errors_in_subdirectory_do_not_abort_root(tmp_store, corpus_dir, monkeyp
     open_dir.mkdir()
     shutil.copy(_emls(corpus_dir)[0], locked / "hidden.eml")
     shutil.copy(_emls(corpus_dir)[0], open_dir / "visible.eml")
-    real_scandir = os.scandir
-
-    def scandir(path="."):
-        if os.fspath(path) == str(locked):
-            raise PermissionError(13, "Access is denied", str(locked))
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    _deny_scandir(monkeypatch, locked)
     r = reconcile(tmp_store, [corpus_dir], 1, 1)
     assert r.aborted_roots == []
     assert [path for path, _ in r.errors] == [str(locked)] and r.errors[0][1].startswith("PermissionError: ")
@@ -284,20 +301,69 @@ def test_errors_in_subdirectory_do_not_abort_root(tmp_store, corpus_dir, monkeyp
     assert len(r.to_parse) == len(_emls(corpus_dir)) + 1
 
 
+def test_errored_subdirectory_rows_are_not_tombstoned(tmp_store, corpus_dir, monkeypatch):
+    sub = corpus_dir / "sub"
+    sub.mkdir()
+    for name in ("one.eml", "two.eml"):
+        shutil.copy(_emls(corpus_dir)[0], sub / name)
+    total = len(_emls(corpus_dir)) + 2
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    _set_status(tmp_store, "indexed")
+
+    _deny_scandir(monkeypatch, sub)
+    r2 = reconcile(tmp_store, [corpus_dir], 2, 2)
+    assert [path for path, _ in r2.errors] == [str(sub)] and r2.aborted_roots == []
+    assert r2.tombstoned == [] and r2.purged == [] and r2.to_parse == []
+    assert tmp_store.counts()["tombstoned"] == 0 and tmp_store.counts()["files"] == total
+    assert tmp_store.get_file(str(sub / "one.eml")).last_seen_scan_id == 2  # kept alive, not merely not tombstoned
+
+    monkeypatch.undo()
+    r3 = reconcile(tmp_store, [corpus_dir], 3, 3)
+    assert r3.to_parse == [] and r3.errors == [] and r3.tombstoned == [] and r3.unchanged == total
+
+
+def test_tombstones_below_an_errored_subdirectory_are_not_purged(tmp_store, corpus_dir, monkeypatch):
+    sub = corpus_dir / "sub"
+    sub.mkdir()
+    shutil.copy(_emls(corpus_dir)[0], sub / "gone.eml")
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    (sub / "gone.eml").unlink()
+    assert reconcile(tmp_store, [corpus_dir], 2, 2).tombstoned == [str(sub / "gone.eml")]
+
+    _deny_scandir(monkeypatch, sub)
+    r3 = reconcile(tmp_store, [corpus_dir], 3, 3)  # old enough to purge, but this scan could not look in `sub`
+    assert r3.purged == [] and tmp_store.counts()["tombstoned"] == 1
+    monkeypatch.undo()
+    r4 = reconcile(tmp_store, [corpus_dir], 4, 4)
+    assert [p.path for p in r4.purged] == [str(sub / "gone.eml")]
+
+
 def test_file_that_cannot_be_read_is_an_error_not_an_abort(tmp_store, corpus_dir, monkeypatch):
     broken = _emls(corpus_dir)[0]
-    real_sha = scan.sha256_file
-
-    def sha256_file_or_fail(path):
-        if str(path) == str(broken):
-            raise PermissionError(13, "The process cannot access the file", str(broken))
-        return real_sha(path)
-
-    monkeypatch.setattr(scan, "sha256_file", sha256_file_or_fail)
+    _deny_reading(monkeypatch, broken)
     r = reconcile(tmp_store, [corpus_dir], 1, 1)
     assert [path for path, _ in r.errors] == [str(broken)] and r.aborted_roots == []
     assert broken not in r.to_parse and len(r.to_parse) == len(_emls(corpus_dir)) - 1
     assert tmp_store.get_file(str(broken)) is None
+
+
+def test_unreadable_file_keeps_its_row(tmp_store, corpus_dir, monkeypatch):
+    target = _emls(corpus_dir)[0]
+    reconcile(tmp_store, [corpus_dir], 1, 1)
+    _set_status(tmp_store, "indexed")
+    before = tmp_store.get_file(str(target))
+    later = target.stat().st_mtime_ns + 5_000_000_000
+    os.utime(target, ns=(later, later))  # the changed mtime makes the scan try to rehash the file
+
+    _deny_reading(monkeypatch, target)
+    r2 = reconcile(tmp_store, [corpus_dir], 2, 2)
+    assert [path for path, _ in r2.errors] == [str(target)] and r2.errors[0][1].startswith("PermissionError: ")
+    assert r2.tombstoned == [] and r2.to_parse == [] and tmp_store.counts()["tombstoned"] == 0
+    assert tmp_store.get_file(str(target)) == replace(before, last_seen_scan_id=2)  # live, no field updated
+
+    monkeypatch.undo()
+    r3 = reconcile(tmp_store, [corpus_dir], 3, 3)  # readable again: the touched file is checked and found unchanged
+    assert r3.errors == [] and r3.to_parse == [] and tmp_store.get_file(str(target)).mtime_ns == later
 
 
 def test_a_large_scan_is_written_in_batches(tmp_store, corpus_dir):

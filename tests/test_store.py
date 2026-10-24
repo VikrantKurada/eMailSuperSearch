@@ -154,6 +154,20 @@ def test_file_manifest_scan_lifecycle(tmp_store, corpus_dir):
     assert tmp_store.purge_tombstoned_under([root], 3) == []
 
 
+def test_purge_tombstoned_under_leaves_skipped_subtrees_alone(tmp_store, corpus_dir):
+    root = str(corpus_dir)
+    kept = os.path.join(root, "locked", "a.eml")
+    purged = os.path.join(root, "open", "b.eml")
+    lookalike = os.path.join(root, "locked-too", "c.eml")  # starts with the skipped path's spelling but is not below it
+    for path in (kept, purged, lookalike):
+        tmp_store.upsert_file(_rec(path, last_seen_scan_id=1))
+    tmp_store.tombstone([kept, purged, lookalike], 10)
+    done = tmp_store.purge_tombstoned_under([root], 5, skip=[os.path.join(root, "locked")])
+    assert sorted(r.path for r in done) == sorted([purged, lookalike])
+    assert tmp_store.get_file(kept) is not None and tmp_store.get_file(purged) is None
+    assert [r.path for r in tmp_store.purge_tombstoned_under([root], 5)] == [kept]
+
+
 def test_stamp_seen_revives_a_tombstoned_path(tmp_store, corpus_dir):
     path = os.path.join(str(corpus_dir), "a.eml")
     tmp_store.upsert_file(_rec(path, message_key="m1", file_id="vol:1"))

@@ -268,11 +268,18 @@ class ProjectStore:
                     (now, *batch),
                 )
 
-    def purge_tombstoned_under(self, roots: list[str], scan_id: int) -> list[FileRecord]:
-        """Delete and return tombstoned rows below ``roots`` that have been unseen for two scans."""
+    def purge_tombstoned_under(self, roots: list[str], scan_id: int, skip: Sequence[str] = ()) -> list[FileRecord]:
+        """Delete and return tombstoned rows below ``roots`` that have been unseen for two scans.
+
+        Rows below any path in ``skip`` (a subtree the scan could not read) are left alone.
+        """
         if not roots:
             return []
         condition, params = _under_roots(roots)
+        if skip:
+            skip_condition, skip_params = _under_roots(skip)
+            condition += f" AND NOT {skip_condition}"
+            params += skip_params
         with self._lock, self.conn:
             rows = self.conn.execute(
                 f"SELECT * FROM files WHERE tombstoned_at IS NOT NULL AND last_seen_scan_id < ? AND {condition} ORDER BY path",

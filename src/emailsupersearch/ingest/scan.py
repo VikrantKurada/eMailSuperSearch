@@ -3,8 +3,9 @@
 ``reconcile`` walks every watched folder with ``os.scandir`` and compares each mail file's ``(size, mtime_ns)`` with
 its manifest row. It hashes only new and changed files, recognises a renamed file by its file identity (no
 re-parse), stamps every file it saw, and tombstones the rows it did not see. A tombstone is purged only once the
-next scan confirms the file is still gone. A folder that cannot be listed is left alone: nothing under it is
-tombstoned or purged. The scan owns the manifest; parsing is the ingest pipeline's job.
+next scan confirms the file is still gone. A root that cannot be listed is left alone: nothing under it is
+tombstoned or purged. So is a subdirectory that cannot be listed, and so is a file that cannot be read: an error
+below a root never costs rows. The scan owns the manifest; parsing is the ingest pipeline's job.
 """
 
 from __future__ import annotations
@@ -57,22 +58,6 @@ def _list_dir(directory: str) -> list[os.DirEntry[str]]:
         return sorted(entries, key=lambda entry: entry.name)
 
 
-def _walk(entries: Iterable[os.DirEntry[str]], errors: list[tuple[str, str]]) -> Iterator[os.DirEntry[str]]:
-    """The mail files among ``entries`` and below them. A folder or entry that raises ``OSError`` is recorded and skipped."""
-    for entry in entries:
-        try:
-            is_dir = entry.is_dir(follow_symlinks=False)
-            is_mail = not is_dir and entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in MAIL_SUFFIXES
-            children = _list_dir(entry.path) if is_dir else []
-        except OSError as e:
-            errors.append((entry.path, _describe(e)))
-            continue
-        if is_dir:
-            yield from _walk(children, errors)
-        elif is_mail:
-            yield entry
-
-
 class _Reconciler:
     """One scan's state: the result being built, the manifest rows waiting to be written and the paths seen."""
 
@@ -82,6 +67,7 @@ class _Reconciler:
         self.result = ScanResult(scan_id)
         self._queued: list[FileRecord] = []
         self._seen: set[str] = set()
+        self._unreadable: list[str] = []  # subtrees (or entries) that raised OSError; their rows are left as they are
 
     def run(self, roots: list[Path], now: int) -> ScanResult:
         live_roots: list[str] = []
@@ -92,12 +78,41 @@ class _Reconciler:
                 self.result.aborted_roots.append(root)
                 continue
             live_roots.append(root)
-            for entry in _walk(entries, self.result.errors):
+            for entry in self._walk(entries):
                 self._visit(entry)
         self._flush()
+        self._keep_unreadable_rows()
         self.store.stamp_seen(list(self._seen), self.scan_id)
         self._remove_missing(live_roots, now)
         return self.result
+
+    # ---- walking ----
+
+    def _walk(self, entries: Iterable[os.DirEntry[str]]) -> Iterator[os.DirEntry[str]]:
+        """The mail files among ``entries`` and below them. An entry or folder that raises ``OSError`` is recorded and skipped."""
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_mail = (
+                    not is_dir and entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in MAIL_SUFFIXES
+                )
+                children = _list_dir(entry.path) if is_dir else []
+            except OSError as e:
+                self._record_error(entry.path, e)
+                self._unreadable.append(entry.path)
+                continue
+            if is_dir:
+                yield from self._walk(children)
+            elif is_mail:
+                yield entry
+
+    def _record_error(self, path: str, error: OSError) -> None:
+        self.result.errors.append((path, _describe(error)))
+
+    def _keep_unreadable_rows(self) -> None:
+        """Mark every live row below an unreadable subtree as seen, so it is neither tombstoned nor purged this scan."""
+        for path in self._unreadable:
+            self._seen.update(rec.path for rec in self.store.unseen_under([path], self.scan_id))
 
     # ---- per file ----
 
@@ -115,9 +130,10 @@ class _Reconciler:
             else:
                 self._settle(row)
         except OSError as e:
-            self.result.errors.append((path, _describe(e)))
-            return
-        self._seen.add(path)
+            self._record_error(path, e)
+            if self.store.get_file(path) is None:
+                return
+        self._seen.add(path)  # a file that could not be read still exists, so its row stays as it was
 
     def _new_file(self, path: str, size: int, mtime_ns: int) -> None:
         sha = sha256_file(Path(path))
@@ -186,10 +202,11 @@ class _Reconciler:
 
         Purging first keeps a file from being tombstoned and purged in the same scan when earlier scans skipped
         the root (an aborted root stamps nothing, so the file's last-seen id can already be two scans old).
+        Tombstones below an unreadable subtree are not purged either: this scan could not confirm they are gone.
         """
         if not live_roots:
             return
-        self.result.purged = self.store.purge_tombstoned_under(live_roots, self.scan_id)
+        self.result.purged = self.store.purge_tombstoned_under(live_roots, self.scan_id, skip=self._unreadable)
         missing = sorted(rec.path for rec in self.store.unseen_under(live_roots, self.scan_id))
         self.store.tombstone(missing, now)
         self.result.tombstoned = missing
