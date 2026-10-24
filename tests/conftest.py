@@ -43,3 +43,12 @@ def parsed_factory():
         return ParsedMessage(**fields)
 
     return make
+
+
+@pytest.fixture
+def corpus_dir(tmp_path):
+    """A directory holding the deterministic six-thread synthetic corpus."""
+    from emailsupersearch.diagnostics.corpus import generate
+
+    generate(tmp_path / "corpus", 6, seed=1)
+    return tmp_path / "corpus"

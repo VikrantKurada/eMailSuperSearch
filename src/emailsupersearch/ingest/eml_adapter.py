@@ -1,0 +1,213 @@
+"""Parse an ``.eml`` file (RFC 5322 / MIME) into a ``ParsedMessage``.
+
+New Outlook saves dragged mail as ``.eml``. Only the stdlib ``email`` package is used.
+"""
+
+from __future__ import annotations
+
+import email
+import email.policy
+import os
+import re
+from datetime import UTC
+from email.message import EmailMessage
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
+from html.parser import HTMLParser
+from pathlib import Path
+
+from emailsupersearch.types import (
+    AttachmentKind,
+    ParsedAttachment,
+    ParsedMessage,
+    Recipient,
+)
+
+# Task 9 replaces this map with the shared ``kind_for``.
+_SUFFIX_KINDS: dict[str, AttachmentKind] = {
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".xlsx": "xlsx",
+    ".xlsm": "xlsx",
+    ".pptx": "pptx",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".tif": "image",
+    ".tiff": "image",
+    ".bmp": "image",
+    ".webp": "image",
+    ".msg": "msg",
+    ".eml": "eml",
+}
+_WHITESPACE = re.compile(r"\s+")
+# fmt: off
+_BLOCK_TAGS = frozenset([
+    "address", "blockquote", "br", "dd", "div", "dt", "h1", "h2", "h3", "h4", "h5", "h6",
+    "hr", "li", "ol", "p", "pre", "table", "tr", "ul",
+])
+# fmt: on
+
+
+def _strip_brackets(token: str) -> str:
+    token = token.strip()
+    if len(token) >= 2 and token[0] == "<" and token[-1] == ">":
+        token = token[1:-1].strip()
+    return token
+
+
+def _raw_header(msg: EmailMessage, name: str) -> str | None:
+    """The first ``name`` header exactly as stored, folding included (the parsed value can lose text)."""
+    wanted = name.lower()
+    return next((str(value) for key, value in msg.raw_items() if key.lower() == wanted), None)
+
+
+def _ids(msg: EmailMessage, name: str) -> list[str]:
+    """Ids in a Message-ID, In-Reply-To, References or Content-ID header, without brackets or whitespace.
+
+    Folding can put a line break inside one id, so whitespace goes before the brackets do.
+    """
+    raw = _raw_header(msg, name) or ""
+    tokens = re.findall(r"<[^<>]*>", raw) or raw.split()
+    return [t for t in (_strip_brackets(_WHITESPACE.sub("", raw_id)) for raw_id in tokens) if t]
+
+
+class _TextExtractor(HTMLParser):
+    """Collect the visible text of an HTML document; block-level tags become line breaks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def _html_to_text(html: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(html)
+    parser.close()
+    lines = (re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in "".join(parser.parts).split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _text_of(part: EmailMessage) -> str:
+    try:
+        return part.get_content()
+    except LookupError:  # a charset Python does not know: keep the text rather than lose the message
+        return (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+
+
+def _kind_for(filename: str, mime: str) -> AttachmentKind:
+    kind = _SUFFIX_KINDS.get(os.path.splitext(filename)[1].lower())
+    if kind is not None:
+        return kind
+    if mime == "message/rfc822":
+        return "eml"
+    if mime.startswith("image/"):
+        return "image"
+    if mime == "application/pdf":
+        return "pdf"
+    return "other"
+
+
+def _sent_ts(msg: EmailMessage) -> int | None:
+    header = msg["Date"]
+    if header is None:
+        return None
+    try:
+        when = parsedate_to_datetime(str(header))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return int(when.timestamp())
+
+
+def _recipients(msg: EmailMessage) -> list[Recipient]:
+    found: list[Recipient] = []
+    for kind in ("to", "cc", "bcc"):
+        values = [str(v) for v in msg.get_all(kind, [])]
+        found.extend(Recipient(kind, name, addr) for name, addr in getaddresses(values) if addr)
+    return found
+
+
+def _attachment_bytes(part: EmailMessage) -> bytes:
+    payload = part.get_payload(decode=True)
+    return payload if isinstance(payload, bytes) else part.as_bytes()
+
+
+def _attachments(msg: EmailMessage, mtime: int) -> list[ParsedAttachment]:
+    found: list[ParsedAttachment] = []
+    for ordinal, part in enumerate(msg.iter_attachments()):
+        filename = part.get_filename() or f"part-{ordinal}"
+        mime = part.get_content_type()
+        nested = None
+        if mime == "message/rfc822":
+            inner = part.get_content()
+            data, nested, kind = inner.as_bytes(), _convert(inner, mtime), "eml"
+        else:
+            data = _attachment_bytes(part)
+            kind = _kind_for(filename, mime)
+        found.append(
+            ParsedAttachment(
+                ordinal,
+                filename,
+                mime,
+                len(data),
+                kind,
+                data=data,
+                nested=nested,
+                content_id=next(iter(_ids(part, "Content-ID")), None),
+            )
+        )
+    return found
+
+
+def _convert(msg: EmailMessage, mtime: int) -> ParsedMessage:
+    sender_name, sender_addr = parseaddr(str(msg["From"] or ""))
+    sent_ts = _sent_ts(msg)
+    plain = msg.get_body(preferencelist=("plain",))
+    html_part = msg.get_body(preferencelist=("html",))
+    body_html = _text_of(html_part) if html_part is not None else None
+    if plain is not None:
+        body_text = _text_of(plain)
+    else:
+        body_text = _html_to_text(body_html) if body_html else ""
+    return ParsedMessage(
+        message_id=next(iter(_ids(msg, "Message-ID")), None),
+        subject=str(msg["Subject"] or ""),
+        sender_name=sender_name,
+        sender_addr=sender_addr,
+        recipients=_recipients(msg),
+        sent_ts=mtime if sent_ts is None else sent_ts,
+        received_ts=None,
+        date_source="mtime" if sent_ts is None else "header_date",
+        body_text=body_text,
+        body_html=body_html,
+        in_reply_to=next(iter(_ids(msg, "In-Reply-To")), None),
+        references=_ids(msg, "References"),
+        conversation_index=None,
+        conversation_topic=None,
+        attachments=_attachments(msg, mtime),
+    )
+
+
+def parse_eml(path: Path) -> ParsedMessage:
+    """Parse one ``.eml`` file; a missing or unreadable ``Date`` falls back to the file's mtime."""
+    with open(path, "rb") as fp:
+        msg = email.message_from_binary_file(fp, policy=email.policy.default)
+    return _convert(msg, int(Path(path).stat().st_mtime))
