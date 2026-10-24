@@ -595,12 +595,15 @@ class ProjectStore:
 
     def clear_index(self) -> None:
         """Empty the index for a full rebuild, in one transaction: every chunk goes (the triggers clear both keyword
-        tables), every vector goes, and every live file row goes back to ``pending`` so the next reconcile re-parses
-        it, from the parse cache when it has the file. Messages, attachments and chains stay until then."""
+        tables), every vector goes, and every live file row goes back to ``pending`` with no reason so the next
+        reconcile re-parses it, from the parse cache when it has the file. Messages, attachments and chains stay
+        until then."""
         with self._lock, self.conn:
             self.conn.execute("DELETE FROM chunks")
             self.conn.execute("DELETE FROM chunks_vec")
-            self.conn.execute("UPDATE files SET parse_status = 'pending' WHERE tombstoned_at IS NULL")
+            self.conn.execute(
+                "UPDATE files SET parse_status = 'pending', status_reason = '' WHERE tombstoned_at IS NULL"
+            )
 
     def pending_file_count(self) -> int:
         """The number of live file rows still waiting to be parsed."""

@@ -8,6 +8,7 @@ import pytest
 from emailsupersearch import store as store_module
 from emailsupersearch.db.schema import SCHEMA_VERSION, SchemaTooNew, schema_version
 from emailsupersearch.ingest.chunker import ChunkText
+from emailsupersearch.jobs.supervisor import RETRY_ON_START_PREFIXES
 from emailsupersearch.store import FileRecord, PartWrite, ProjectStore, ScanUpdate
 from emailsupersearch.types import AttachmentText, ParsedAttachment, Recipient
 
@@ -580,6 +581,7 @@ def test_retry_failed_files_resets_only_matching_failures(tmp_store, corpus_dir)
         "t.eml": ("failed", "timeout"),
         "m.eml": ("failed", "memory_cap"),
         "w.eml": ("failed", "worker died: BrokenProcessPool()"),
+        "c.eml": ("failed", "pool closed"),  # a stop closed the parse pool under the file
         "p.eml": ("failed", "ParseError: bad header"),
         "d.eml": ("failed", "memory-cap"),  # "_" is matched literally, not as a LIKE wildcard
         "i.eml": ("indexed", "timeout"),  # not failed: left alone
@@ -587,13 +589,14 @@ def test_retry_failed_files_resets_only_matching_failures(tmp_store, corpus_dir)
     for name, (status, reason) in rows.items():
         tmp_store.upsert_file(_rec(os.path.join(root, name), parse_status=status, status_reason=reason))
 
-    assert tmp_store.retry_failed_files(("timeout", "memory_cap", "worker")) == 3
+    assert tmp_store.retry_failed_files(RETRY_ON_START_PREFIXES) == 4
 
     def state(name: str) -> tuple[str, str]:
         rec = tmp_store.get_file(os.path.join(root, name))
         return rec.parse_status, rec.status_reason
 
-    assert {n: state(n) for n in ("t.eml", "m.eml", "w.eml")} == dict.fromkeys(("t.eml", "m.eml", "w.eml"), ("pending", ""))
+    retried = ("t.eml", "m.eml", "w.eml", "c.eml")
+    assert {n: state(n) for n in retried} == dict.fromkeys(retried, ("pending", ""))
     assert {n: state(n) for n in ("p.eml", "d.eml", "i.eml")} == {n: rows[n] for n in ("p.eml", "d.eml", "i.eml")}
     assert tmp_store.retry_failed_files(()) == 0
 
@@ -623,8 +626,9 @@ def test_clear_index_drops_chunks_and_vectors_and_resets_live_files(tmp_store, c
     assert _vec_ids(tmp_store) == set()
     assert not tmp_store.conn.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'invoice'").fetchall()
     assert not tmp_store.conn.execute("SELECT rowid FROM chunks_trigram WHERE chunks_trigram MATCH '\"INV-2024\"'").fetchall()
-    assert tmp_store.get_file(os.path.join(root, "a.eml")).parse_status == "pending"
-    assert tmp_store.get_file(os.path.join(root, "b.eml")).parse_status == "pending"
+    for name in ("a.eml", "b.eml"):
+        rec = tmp_store.get_file(os.path.join(root, name))
+        assert (rec.parse_status, rec.status_reason) == ("pending", "")
     assert tmp_store.get_file(os.path.join(root, "gone.eml")).parse_status == "indexed"  # tombstoned rows stay
 
 

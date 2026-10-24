@@ -130,6 +130,9 @@ def _sync(args: argparse.Namespace) -> int:
     if reason is not None:
         print(reason, file=sys.stderr)
         return 2
+    if not (project_dir(root, args.project) / "project.sqlite").is_file():  # sync never creates a project
+        print(f"unknown project: {args.project}", file=sys.stderr)
+        return 2
     ensure_layout(root)
     # Imported here, not at the top, for the reason given in `_bench`.
     from emailsupersearch.index.embedder import load_default_embedder, tokenizer_path
@@ -144,6 +147,7 @@ def _sync(args: argparse.Namespace) -> int:
     sup = build_project_supervisor(args.project, store, embedder, chunker, root / "cache" / "parsed", on_event=None)
     if args.once:
         try:
+            sup.prepare()  # a pending re-index and the failed-file retry, as start() would do
             r = sup.run_once()
         finally:
             sup.stop()

@@ -47,11 +47,13 @@ class FolderWatcher:
         on_change: Callable[[set[Path]], None],
         debounce_s: float = 2.0,
         force_polling: bool = False,
+        poll_delay_ms: int = 300,
     ) -> None:
         self.roots = [Path(r) for r in roots]
         self.on_change = on_change
         self.debounce_s = debounce_s
         self.force_polling = force_polling
+        self.poll_delay_ms = poll_delay_ms  # how often polling looks again (only with ``force_polling``)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -69,13 +71,18 @@ class FolderWatcher:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop watching and wait up to five seconds for the thread to end. Safe to call twice, or before ``start``."""
+        """Stop watching and wait up to five seconds for the thread to end. Safe to call twice, or before ``start``.
+
+        Called from ``on_change`` (on the watcher's own thread), it does not wait: the loop ends when the callback
+        returns.
+        """
         self._stop.set()
         thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=_STOP_TIMEOUT_S)
-            if thread.is_alive():
-                log.warning("the folder watcher did not stop within %d s", _STOP_TIMEOUT_S)
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=_STOP_TIMEOUT_S)
+        if thread.is_alive():
+            log.warning("the folder watcher did not stop within %d s", _STOP_TIMEOUT_S)
 
     def _run(self, roots: list[Path]) -> None:
         try:
@@ -83,6 +90,7 @@ class FolderWatcher:
                 *roots,
                 debounce=int(self.debounce_s * 1000),
                 force_polling=self.force_polling,
+                poll_delay_ms=self.poll_delay_ms,
                 stop_event=self._stop,
                 rust_timeout=_RUST_TIMEOUT_MS,
             ):

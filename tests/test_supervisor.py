@@ -1,7 +1,9 @@
 """The project supervisor: reconcile on start, on a timer and on watcher triggers; OCR dispatch; full re-index."""
 
+import logging
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,8 @@ from helpers import make_eml_bytes, wait_until
 
 from emailsupersearch.cli import main
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
-from emailsupersearch.ingest.watcher import is_network_path
+from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
+from emailsupersearch.jobs import supervisor as supervisor_module
 from emailsupersearch.jobs.queue import pending_counts
 from emailsupersearch.jobs.supervisor import build_project_supervisor
 
@@ -27,6 +30,11 @@ def _supervisor_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name.startswith("ess-") and t.is_alive()]
 
 
+def _assert_closed(store) -> None:
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.conn.execute("SELECT 1")
+
+
 def test_run_once_indexes_corpus(sup, corpus_dir):
     r = sup.run_once()
     assert r.to_parse and sup.store.counts()["messages"] > 0 and sup.store.get_setting("last_synced_at")
@@ -37,7 +45,8 @@ def test_timer_rescans(sup_fast, corpus_dir):
     (corpus_dir / "new.eml").write_bytes(make_eml_bytes())
     wait_until(lambda: sup_fast.store.get_file(str(corpus_dir / "new.eml")), 10)
     seen = _scan_id(sup_fast)
-    wait_until(lambda: _scan_id(sup_fast) >= seen + 2, 10)  # nothing changes now: only the timer scans
+    # Nothing changes now; at most one more scan can come from the watcher, so three prove the timer re-arms.
+    wait_until(lambda: _scan_id(sup_fast) >= seen + 3, 10)
     sup_fast.stop()
 
 
@@ -46,6 +55,19 @@ def test_watcher_triggers_rescan(sup_slow, corpus_dir):
     wait_until(_started_and_idle(sup_slow), 30)  # the start-up scan is over: only the watcher can see the new file
     (corpus_dir / "w.eml").write_bytes(make_eml_bytes("w"))
     wait_until(lambda: sup_slow.store.get_file(str(corpus_dir / "w.eml")), 15)
+    sup_slow.stop()
+
+
+def test_refresh_watchers_watches_a_new_folder(sup_slow, corpus_dir):
+    sup_slow.start()
+    wait_until(_started_and_idle(sup_slow), 30)
+    more = corpus_dir.parent / "more"
+    more.mkdir()
+    sup_slow.store.add_folder(str(more), "local")
+    sup_slow.refresh_watchers()
+    new_file, data = more / "x.eml", make_eml_bytes("x", seed=7)
+    # Written until it is indexed, so a watcher still setting up cannot miss it; only the new watcher sees "more".
+    wait_until(lambda: (new_file.write_bytes(data), sup_slow.store.get_file(str(new_file)))[1], 15)
     sup_slow.stop()
 
 
@@ -80,7 +102,7 @@ def test_changed_embedder_id_forces_full_reindex(tmp_store, corpus_dir, chunker,
     try:
         assert tmp_store.get_setting("reindex_required") is True
         s2.start()
-        # The flag clears once the index is emptied, and the state stays busy until the re-parse is over.
+        # The flag clears once the index is emptied (0 chunks), so this holds only after the rebuild.
         wait_until(
             lambda: tmp_store.get_setting("reindex_required") is False
             and s2.status().state == "idle"
@@ -89,6 +111,21 @@ def test_changed_embedder_id_forces_full_reindex(tmp_store, corpus_dir, chunker,
         )
     finally:
         s2.stop()
+
+
+def test_run_once_after_prepare_reindexes(sup):
+    sup.run_once()
+    n = sup.store.counts()["chunks"]
+    sup.store.set_setting("reindex_required", True)
+    sup.prepare()
+    counts = sup.store.counts()
+    assert counts["chunks"] == 0 and sup.status().files_pending == counts["files"] > 0
+    assert sup.store.get_setting("reindex_required") is False
+    sup.run_once()
+    assert sup.store.counts()["chunks"] == n
+    sup.store.set_setting("reindex_required", True)
+    sup.prepare()  # only the first call acts
+    assert sup.store.counts()["chunks"] == n
 
 
 def test_is_network_path():
@@ -101,6 +138,14 @@ def test_cli_sync_refuses_onedrive_root(monkeypatch, capsys):
     assert "OneDrive" in capsys.readouterr().err
 
 
+def test_cli_sync_refuses_an_unknown_project(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "data"
+    monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(root))
+    assert main(["sync", "--project", "nope", "--once"]) == 2
+    assert "unknown project: nope" in capsys.readouterr().err
+    assert not root.exists()  # nothing was created
+
+
 def test_stop_is_idempotent_and_closes_store(sup):
     sup.start()
     wait_until(_started_and_idle(sup), 60)
@@ -108,10 +153,55 @@ def test_stop_is_idempotent_and_closes_store(sup):
     sup.stop()
     sup.stop()
     assert not _supervisor_threads()
-    with pytest.raises(sqlite3.ProgrammingError):
-        sup.store.conn.execute("SELECT 1")
+    _assert_closed(sup.store)
     with pytest.raises(RuntimeError):
         sup.store.read_conn()
+    status = sup.status()  # the last status known, marked closed
+    assert (status.state, status.last_error) == ("idle", "closed") and status.files_total > 0
+
+
+def test_stop_during_long_scan_returns_quickly(sup, monkeypatch):
+    monkeypatch.setattr(supervisor_module, "_APPLY_SLICE", 1)  # the corpus is smaller than one real slice
+    ingest = sup.pipeline.ingest_file
+
+    def slow_ingest(path, scan_id):
+        time.sleep(0.5)
+        return ingest(path, scan_id)
+
+    monkeypatch.setattr(sup.pipeline, "ingest_file", slow_ingest)
+    sup.start()
+    wait_until(lambda: any(e["type"] == "file_indexed" for e in sup.events_for_tests), 30)
+    began = time.monotonic()
+    sup.stop()
+    assert time.monotonic() - began < 5
+    assert not _supervisor_threads()
+    _assert_closed(sup.store)
+
+
+def test_stop_from_an_event_callback_closes_on_exit(sup):
+    def stop_on_scan(event: dict) -> None:
+        if event["type"] == "scan_started":
+            sup.stop()  # on the worker thread: it must not wait for itself
+
+    sup.on_event = stop_on_scan
+    sup.start()
+    wait_until(lambda: not _supervisor_threads(), 30)
+    _assert_closed(sup.store)
+
+
+def test_watcher_stop_from_on_change_does_not_wait(tmp_path, caplog):
+    seen: list[set[Path]] = []
+
+    def on_change(dirs: set[Path]) -> None:
+        seen.append(dirs)
+        watcher.stop()
+
+    watcher = FolderWatcher([tmp_path], on_change, debounce_s=0.1)
+    watcher.start()
+    with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
+        wait_until(lambda: ((tmp_path / "a.eml").write_bytes(b"x"), seen)[1], 10)
+        wait_until(lambda: not _supervisor_threads(), 5)
+    assert not [r for r in caplog.records if "folder watcher" in r.getMessage()]
 
 
 def test_failed_rows_are_retried_once_on_start(sup, corpus_dir):
@@ -136,6 +226,10 @@ def test_orphan_messages_are_swept(sup, corpus_dir):
     assert sup.store.message(key) is None and sup.store.chunk_rowids(key) == []
 
 
+def _ocr_jobs(sup) -> list[tuple]:
+    return [tuple(r) for r in sup.store.read_conn().execute("SELECT state, attempts, last_error FROM jobs")]
+
+
 def test_ocr_failure_unavailable_is_final(sup_with_ocr, monkeypatch):
     calls: list[dict] = []
 
@@ -149,17 +243,39 @@ def test_ocr_failure_unavailable_is_final(sup_with_ocr, monkeypatch):
         lambda: pending_counts(sup_with_ocr.store.read_conn())["failed"] >= 1 and sup_with_ocr.status().state == "idle",
         60,
     )
-    jobs = sup_with_ocr.store.read_conn().execute("SELECT state, attempts FROM jobs").fetchall()
+    jobs = _ocr_jobs(sup_with_ocr)
     sup_with_ocr.stop()
-    assert jobs and all((state, attempts) == ("failed", 1) for state, attempts in jobs)
+    assert jobs and all(job[:2] == ("failed", 1) for job in jobs)
     assert len(calls) == len(jobs)
+
+
+def test_ocr_failure_timeout_is_retried(sup_with_ocr, monkeypatch):
+    calls: list[dict] = []
+
+    def times_out_once(payload: dict, language: str) -> str:
+        calls.append(payload)
+        if len(calls) == 1:
+            raise OcrJobFailed("timeout")
+        return "recovered text"
+
+    monkeypatch.setattr(sup_with_ocr.ocr_runner, "run", times_out_once)
+    sup_with_ocr.start()
+    wait_until(
+        lambda: pending_counts(sup_with_ocr.store.read_conn())["done"] >= 1 and sup_with_ocr.status().state == "idle",
+        60,
+    )
+    jobs = _ocr_jobs(sup_with_ocr)
+    sup_with_ocr.stop()
+    # The timeout put the job back in the queue with one attempt counted; the second run completed it.
+    assert jobs == [("done", 1, "timeout")] and len(calls) == 2
 
 
 def test_request_rescan_coalesces(sup):
     for _ in range(5):
         sup.request_rescan()
+    assert sup._commands.qsize() == 1  # the burst queued one command
     sup.start()
-    wait_until(_started_and_idle(sup, scans=2), 60)
-    sup.stop()  # every command queued before the stop is run first
+    wait_until(_started_and_idle(sup, scans=2), 60)  # the start-up scan, then the one rescan
+    sup.stop()
     finished = [e for e in sup.events_for_tests if e["type"] == "scan_finished"]
     assert 1 <= len(finished) <= 2 and max(e["scan_id"] for e in finished) <= 2
