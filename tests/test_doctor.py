@@ -17,6 +17,7 @@ from emailsupersearch.diagnostics.doctor import (
     data_root,
     degraded_features,
     memory_disk,
+    models_package,
     native_imports,
     path_headroom,
     render_report,
@@ -69,7 +70,7 @@ def test_render_report_lists_every_check_remedy_degraded_and_time():
 
 
 def test_degraded_features_names_semantic_search_and_ocr():
-    ok, bad = Check("models_package", "ok", ""), Check("models_package", "fail", "")
+    ok, bad = Check("models_package", "ok", ""), Check("models_package", "warn", "")
     ocr_ok, ocr_none = Check("ocr_languages", "ok", "en-US"), Check("ocr_languages", "warn", "")
     assert degraded_features([ok, ocr_ok], rapidocr_loaded=False) == []
     assert degraded_features([bad, ocr_ok], rapidocr_loaded=False) == ["semantic search"]
@@ -223,3 +224,19 @@ def test_probe_modules_reports_a_crashed_or_hung_child(monkeypatch):
 
     monkeypatch.setattr(doctor.subprocess, "run", hung)
     assert "timed out after 60 s" in doctor._probe_modules().error
+
+
+def test_models_package_missing_is_a_warning_and_a_broken_one_is_a_failure(monkeypatch):
+    from emailsupersearch.index import embedder
+
+    monkeypatch.setattr(embedder, "load_default_embedder", lambda: None)
+    c = models_package()
+    assert c.status == "warn" and c.remedy == ""
+    assert c.detail == "models package not installed; semantic search disabled (pip install emailsupersearch[nlp])"
+
+    def broken():
+        raise RuntimeError("model.onnx is corrupt")
+
+    monkeypatch.setattr(embedder, "load_default_embedder", broken)
+    c = models_package()
+    assert c.status == "fail" and "RuntimeError: model.onnx is corrupt" in c.detail

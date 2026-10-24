@@ -433,7 +433,7 @@ def models_package() -> _Result:
 
     embedder = load_default_embedder()
     if embedder is None:
-        return _Result("fail", "emailsupersearch-models-en is missing or incomplete; semantic search is off", "pip install emailsupersearch[nlp]")
+        return _Result("warn", "models package not installed; semantic search disabled (pip install emailsupersearch[nlp])")
     return _Result("ok", f"embedder {embedder.id}, {embedder.dim} dimensions")
 
 
