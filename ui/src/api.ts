@@ -3,6 +3,7 @@ import type {
   ExportInfo,
   MessageDetail,
   Project,
+  ProjectDetail,
   ProjectSettings,
   SavedSearch,
   SearchFilters,
@@ -72,7 +73,12 @@ export class Api {
     return this.request("GET", "/api/projects");
   }
 
-  createProject(body: { name: string; folders: string[]; language: string }): Promise<Project> {
+  /** One project with its watched folders. */
+  project(id: string): Promise<ProjectDetail> {
+    return this.request("GET", projectPath(id));
+  }
+
+  createProject(body: { name: string; folders: string[]; language?: string }): Promise<Project> {
     return this.request("POST", "/api/projects", body);
   }
 

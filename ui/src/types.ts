@@ -80,6 +80,9 @@ export type SyncStatus = {
 
 export type Project = { id: string; name: string; created_at: number; dir: string };
 
+/** The body of `GET /api/projects/{id}`: the project plus its watched folders (empty when it is not open). */
+export type ProjectDetail = Project & { folders: string[] };
+
 /** The body of `GET /api/status`; `blocked` is the reason a project has no running supervisor, else null. */
 export type Status = {
   version: string;

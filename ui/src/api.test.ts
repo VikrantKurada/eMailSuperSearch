@@ -169,6 +169,7 @@ describe("Api", () => {
     await api.pickFolder();
     await api.projects();
     await api.createProject({ name: "n", folders: ["C:\\mail"], language: "en" });
+    await api.project("p1");
     await api.settings();
     await api.putProjectSettings("p1", { ocr_enabled: false });
     await api.shutdown();
@@ -179,6 +180,7 @@ describe("Api", () => {
       "POST /api/pick-folder",
       "GET /api/projects",
       "POST /api/projects",
+      "GET /api/projects/p1",
       "GET /api/settings",
       "PUT /api/projects/p1/settings",
       "POST /api/shutdown",
