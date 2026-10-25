@@ -17,7 +17,10 @@ jobs:
       matrix:
         python: ["3.12", "3.13"]
     steps:
+      # No token is left in .git/config for the steps that run project code; only the tag step below gets one.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -62,7 +65,7 @@ jobs:
       - name: Check that the documented install line resolves to wheels
         run: |
           python -m pip install --dry-run --ignore-installed --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console --find-links dist --report "$RUNNER_TEMP/report.json" "emailsupersearch[all]"
-          python -c "import json, os; r = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'report.json'), encoding='utf-8')); bad = [i['metadata']['name'] for i in r['install'] if not i['download_info']['url'].endswith('.whl') and i['metadata']['name'].lower().replace('_', '-') not in ('red-black-tree-mod', 'win-unicode-console')]; assert not bad, 'packages that would build from source: ' + ', '.join(bad); print(len(r['install']), 'packages resolve to wheels, except the two named source archives')"
+          python -c "import json, os; r = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'report.json'), encoding='utf-8')); bad = [i['metadata']['name'] for i in r['install'] if not i['download_info']['url'].endswith('.whl') and i['metadata']['name'].lower().replace('_', '-') not in ('red-black-tree-mod', 'win-unicode-console')]; assert not bad, 'packages that would build from source: ' + ', '.join(bad); assert len(r['install']) > 50, 'the resolution looks incomplete: ' + str(len(r['install'])) + ' packages'; print(len(r['install']), 'packages resolve to wheels, except the two named source archives')"
 
       - name: Check the size of the UI bundle
         run: |
@@ -80,6 +83,8 @@ jobs:
 
       - name: Commit the lock file (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -87,6 +92,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "the lock file is unchanged"
           else
-            git commit -m "chore: lock file for Python ${{ matrix.python }} at ${GITHUB_REF_NAME}" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-            git push origin "HEAD:refs/heads/lock/${GITHUB_REF_NAME}-py${{ matrix.python }}"
+            git commit -m "chore: lock file for Python ${{ matrix.python }} at ${GITHUB_REF_NAME}"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/lock/${GITHUB_REF_NAME}-py${{ matrix.python }}"
           fi

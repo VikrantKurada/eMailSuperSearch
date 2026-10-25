@@ -225,7 +225,7 @@ A project has: id, name, one or more source folders (local path or UNC), languag
 | `recipients` | message_key, kind (to, cc, bcc), name, addr |
 | `attachments` | message_key, ordinal, filename, mime, size, kind (pdf, docx, xlsx, pptx, image, msg, eml, other), extract_status, ocr_status, page_count, text_chars |
 | `chunks` | chunk_id, message_key, part (`body` or `att:<ordinal>`), idx, text, token_count |
-| `chunks_fts` | FTS5 external-content index over `chunks.text` (unicode61 with `tokenchars '-_#@.'`) |
+| `chunks_fts` | FTS5 external-content index over `chunks.text` (unicode61 with `tokenchars '-_#@'`). The full stop is not a token character: with it, a sentence-final `summary.` would be a different token from `summary`; an address such as `jane.doe@example.com` matches as a phrase instead, and identifiers keep `-`, `_`, `#` and `@` |
 | `chunks_trigram` | FTS5 trigram index for substring matches on identifiers |
 | `chunks_vec` | sqlite-vec `vec0` table: chunk rowid, float32[384], partition by message_key where useful |
 | `chains` | chain_id, root_message_key, subject, first_ts, last_ts, message_count, participants_json |
