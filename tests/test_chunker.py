@@ -140,4 +140,6 @@ def test_huge_unbroken_token_is_split_in_near_linear_time(chunker, kind):
     start = time.perf_counter()
     out = chunker.chunk(blob, "ctx")
     elapsed = time.perf_counter() - start
-    assert elapsed < 3 and len(out) > 100 and all(c.token_count <= 256 for c in out)
+    # The quadratic splitter this guards against took over 40 s on the 1 MB blob on a fast desktop; the linear
+    # one takes about 1.3 s there and about 3 s on a shared CI runner, so 20 s separates them on any machine.
+    assert elapsed < 20 and len(out) > 100 and all(c.token_count <= 256 for c in out)
