@@ -2,7 +2,7 @@
 
 eMailSuperSearch is a Python library you install with `pip` into its own virtual environment. It needs no administrator rights, no compiler and no network after the install. This page is the whole procedure for a locked-down Windows laptop.
 
-The package is not on PyPI yet. Each [GitHub release](https://github.com/VikrantKurada/eMailSuperSearch/releases) carries its two wheels: the application and the English model. The commands below install release v0.1.1; for a newer release, use the file names from its notes.
+The package is not on PyPI yet. Each [GitHub release](https://github.com/VikrantKurada/eMailSuperSearch/releases) carries its two wheels: the application and the English model. The commands below install release v0.1.2; for a newer release, use the file names from its notes.
 
 ## Requirements
 
@@ -18,11 +18,11 @@ Three lines in a Command Prompt:
 
 ```bat
 py -3.12 -m venv %LOCALAPPDATA%\eMailSuperSearch\venv
-%LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch-0.1.1-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
+%LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch-0.1.2-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
 %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m emailsupersearch
 ```
 
-If the company network stops pip from downloading from GitHub, download the two wheels from the [release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.1) in a browser, put them in a local folder such as `C:\ess-wheels`, and replace the middle line with:
+If the company network stops pip from downloading from GitHub, download the two wheels from the [release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.2) in a browser, put them in a local folder such as `C:\ess-wheels`, and replace the middle line with:
 
 ```bat
 %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console --find-links C:\ess-wheels "emailsupersearch[all]"
@@ -83,7 +83,7 @@ pip download -r requirements-lock-3.12.txt --no-deps --only-binary=:all: --no-bi
 pip download --no-deps --only-binary=:all: setuptools -d bundle
 ```
 
-Then download the two wheels from the [release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.1) into the same `bundle` folder.
+Then download the two wheels from the [release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.2) into the same `bundle` folder.
 
 On the laptop, in the virtual environment from the Install section:
 
@@ -101,11 +101,11 @@ Notes:
 ## Stop, upgrade, purge
 
 - Stop the host: `python -m emailsupersearch stop`, or "Stop host" in Settings. `stop` waits up to 90 seconds for the host process to exit, printing a dot every 5 seconds, and then prints "stopped" (or "not running" when there was none, or "still running" if it gave up).
-- Upgrade: stop the host, wait until `stop` prints "stopped", install the new release, start it again. Upgrading while the host still runs fails or leaves a broken install, because Windows will not replace a library a running process has loaded. Take the two file names from the new release's notes; for example, for v0.1.1:
+- Upgrade: stop the host, wait until `stop` prints "stopped", install the new release, start it again. Upgrading while the host still runs fails or leaves a broken install, because Windows will not replace a library a running process has loaded. Take the two file names from the new release's notes; for example, for v0.1.2:
 
   ```bat
   %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m emailsupersearch stop
-  %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --upgrade --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch-0.1.1-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
+  %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --upgrade --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch-0.1.2-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
   %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m emailsupersearch serve
   ```
 
@@ -123,7 +123,7 @@ An Excel export also holds a hyperlink to each message file. Office may show a "
 - Run `python -m emailsupersearch doctor`. It checks the Python build, the Microsoft C runtime DLLs, each native module (imported in a subprocess, with its signature status), Windows OCR languages, SQLite features, memory and disk, the data root and the `.msg` handler, and prints a redacted report that is safe to hand to IT. `--json` prints it as JSON. A line marked WARN is advice, not a failure; "Degraded" names any feature that is switched off because a native module could not load.
 - Logs are in `%LOCALAPPDATA%\eMailSuperSearch\logs\host.log`. A headless host (`--headless`) writes what the console would have shown to `host-stderr.log` in the same folder.
 - "another instance is starting" (exit code 1): another launch holds the single-instance lock and is still starting. Wait a few seconds and run the command again. If nothing is running, the lock was left by a crash; it is recognised as stale and replaced on the next start. `python -m emailsupersearch stop` clears up a host that is half started.
-- A refused data root (exit code 2) prints its reason: the folder is inside OneDrive, Documents or Desktop, is a file, or already holds files but no eMailSuperSearch marker, so it is not a folder the program made. Remove `EMAILSUPERSEARCH_DATA_ROOT` or point it at a new or empty folder. A refused `data_root` setting is ignored with a warning and the default folder is used.
+- A refused data root (exit code 2) prints its reason: the folder is inside OneDrive, Documents or Desktop, is a file, or already holds files other than a Python virtual environment but no eMailSuperSearch marker, so it is not a folder the program made. Version 0.1.1 also refused the default folder when it held only the install's `venv`; upgrade to 0.1.2, or create the empty marker file with `type nul > "%LOCALAPPDATA%\eMailSuperSearch\.emailsupersearch"` and start again. Remove `EMAILSUPERSEARCH_DATA_ROOT` or point it at a new or empty folder. A refused `data_root` setting is ignored with a warning and the default folder is used.
 - pip cannot reach PyPI through the company proxy (timeouts, or SSL certificate errors): give pip the proxy once with `python -m pip config set global.proxy http://proxy.example.com:8080` (your IT department has the address), and if the proxy inspects TLS add `--trusted-host pypi.org --trusted-host files.pythonhosted.org` to the install line. Without any route to PyPI, use the Offline bundle.
 - The install says it cannot find `emailsupersearch` or `emailsupersearch-models-en`: the package is not on PyPI, so use the release URLs from the Install section, or download the two wheels from the release page and add `--find-links` with their folder. The install says it needs a compiler: the `--only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console` flags are missing from the command, or the Python version is not 3.12 or 3.13.
 - A native module reported as blocked by `doctor` (AppLocker, Smart App Control or Defender): if it is `onnxruntime`, the engine behind semantic search, the app still runs, keyword-only, and the status line says "No semantic search". The degraded mode covers the embedder only: `sqlite-vec` (the vector index), `tokenizers` (used to cut text into chunks) and `pdfium` (PDF text) are hard requirements, and the host does not start without them. Give IT the `doctor` report.

@@ -160,17 +160,29 @@ def read_only_uri(path: Path) -> str:
     return f"{uri}?mode=ro"
 
 
+def _is_python_environment(entry: Path) -> bool:
+    """Whether ``entry`` is a Python virtual environment (it holds ``pyvenv.cfg``)."""
+    try:
+        return entry.is_dir() and (entry / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
+
+
 def _not_ours(root: Path) -> str | None:
-    """Why ``serve`` must not take ``root`` on: it is a file, or a folder that holds files but no marker."""
+    """Why ``serve`` must not take ``root`` on: it is a file, or a folder that holds files but no marker.
+
+    A Python virtual environment does not count: the install guide puts the app's own ``venv`` inside the default data
+    folder before the app first runs, so that folder must be taken on. A purge never removes it.
+    """
     if not root.exists() or is_marked(root):
         return None
     if not root.is_dir():
         return "the data root is a file, not a folder"
     try:
-        empty = next(root.iterdir(), None) is None
+        others = [entry for entry in root.iterdir() if not _is_python_environment(entry)]
     except OSError:
         return "the data root folder cannot be read"
-    if empty:
+    if not others:
         return None
     return (
         "the data root folder already holds files but no eMailSuperSearch marker, so it is not a data root this"

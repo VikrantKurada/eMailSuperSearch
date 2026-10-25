@@ -21,10 +21,10 @@ You need Windows 10 or 11 (64-bit), a standard user account, and access to PyPI 
 3. **Install the app from the release.** This fetches both files from GitHub and everything else from PyPI, and takes a few minutes.
 
    ```bat
-   %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch-0.1.1-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.1/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
+   %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console "emailsupersearch[all] @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch-0.1.2-py3-none-any.whl" "emailsupersearch-models-en @ https://github.com/VikrantKurada/eMailSuperSearch/releases/download/v0.1.2/emailsupersearch_models_en-0.1.0-py3-none-any.whl"
    ```
 
-   If your company network blocks pip from downloading from GitHub, download the two `.whl` files from the [v0.1.1 release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.1) in your browser instead, put them in `C:\ess-wheels`, and run:
+   If your company network blocks pip from downloading from GitHub, download the two `.whl` files from the [v0.1.2 release page](https://github.com/VikrantKurada/eMailSuperSearch/releases/tag/v0.1.2) in your browser instead, put them in `C:\ess-wheels`, and run:
 
    ```bat
    %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m pip install --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console --find-links C:\ess-wheels "emailsupersearch[all]"

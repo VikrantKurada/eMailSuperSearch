@@ -271,6 +271,59 @@ def test_serve_refuses_nonempty_unmarked_root(tmp_path, redirects, capsys, must_
     assert _tree(root) == ["report.docx"] and redirects == []
 
 
+def _make_venv(path: Path) -> None:
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(path)], check=True, capture_output=True, timeout=120)
+
+
+def test_start_command_accepts_its_default_folder_holding_only_the_install_venv(tmp_path):
+    # The README installs into %LOCALAPPDATA%\eMailSuperSearch\venv, inside the default data folder, before the app has
+    # ever run. 0.1.1 refused that folder on first start: "already holds files but no eMailSuperSearch marker".
+    root = tmp_path / "eMailSuperSearch"
+    _make_venv(root / "venv")
+    env = {**os.environ, "EMAILSUPERSEARCH_DATA_ROOT": str(root)}
+    out_path = tmp_path / "host-output.txt"
+    with open(out_path, "w", encoding="utf-8") as out:
+        host = subprocess.Popen(
+            [sys.executable, "-m", "emailsupersearch", "serve", "--no-browser"], env=env, stdout=out, stderr=out
+        )
+    try:
+        info = wait_until(lambda: host.poll() is not None or read_running(root), _START_S)
+        assert host.poll() is None, out_path.read_text(encoding="utf-8")  # it is serving, not refusing
+        assert _health(info.port)
+        assert is_marked(root) and (root / "venv" / "pyvenv.cfg").is_file()
+        stopped = subprocess.run(
+            [sys.executable, "-m", "emailsupersearch", "stop"],
+            check=False,  # the return code is asserted below, with the output
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert stopped.returncode == 0 and "stopped" in stopped.stdout
+        assert host.wait(_EXIT_S) == 0
+    finally:
+        if host.poll() is None:
+            host.kill()
+            host.wait(_EXIT_S)
+    assert (root / "venv" / "pyvenv.cfg").is_file()  # the install is untouched
+
+
+def test_serve_still_refuses_a_venv_beside_other_files(tmp_path, redirects, capsys, must_refuse):
+    root = tmp_path / "work"
+    _make_venv(root / "venv")
+    (root / "report.docx").write_text("the owner's own file")
+    assert serve(root, None, True, False) == 2
+    assert "marker" in capsys.readouterr().err and not is_marked(root)
+
+
+def test_serve_refuses_a_plain_folder_named_venv(tmp_path, redirects, capsys, must_refuse):
+    root = tmp_path / "work"
+    (root / "venv").mkdir(parents=True)
+    (root / "venv" / "notes.txt").write_text("not a Python environment")
+    assert serve(root, None, True, False) == 2
+    assert "marker" in capsys.readouterr().err and not is_marked(root)
+
+
 def test_serve_then_stop_roundtrip(tmp_path, redirects):
     root = tmp_path / "root"
     with running_host(root) as host:
