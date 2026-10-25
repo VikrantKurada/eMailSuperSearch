@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 from helpers import make_eml_bytes, wait_until
 
+from emailsupersearch.catalog import Catalog
 from emailsupersearch.cli import main
+from emailsupersearch.host.lock import acquire
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.jobs import supervisor as supervisor_module
@@ -146,6 +148,35 @@ def test_cli_sync_refuses_an_unknown_project(monkeypatch, tmp_path, capsys):
     assert not root.exists()  # nothing was created
 
 
+def test_cli_sync_refuses_while_the_host_runs(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.setenv("EMAILSUPERSEARCH_DATA_ROOT", str(root))
+    lock = acquire(root)  # a live process (this one) holds the host's lock
+    try:
+        assert main(["sync", "--project", "p", "--once"]) == 1
+    finally:
+        lock.release()
+    assert "host is running; use the app's Sync now" in capsys.readouterr().err
+
+
+def test_cli_sync_runs_from_the_data_root_setting(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("EMAILSUPERSEARCH_DATA_ROOT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    catalog = Catalog(tmp_path / "local" / "eMailSuperSearch")
+    try:
+        catalog.set_setting("data_root", str(tmp_path / "next"))
+    finally:
+        catalog.close()
+    (tmp_path / "next").mkdir()
+    lock = acquire(tmp_path / "next")  # the host runs from the root the setting names
+    try:
+        assert main(["sync", "--project", "p", "--once"]) == 1
+    finally:
+        lock.release()
+    assert "host is running" in capsys.readouterr().err
+
+
 def test_stop_is_idempotent_and_closes_store(sup):
     sup.start()
     wait_until(_started_and_idle(sup), 60)
@@ -171,7 +202,7 @@ def test_status_raises_store_errors_while_the_store_is_open(sup, monkeypatch):
 
 
 def test_stop_during_long_scan_returns_quickly(sup, monkeypatch):
-    monkeypatch.setattr(supervisor_module, "_APPLY_SLICE", 1)  # the corpus is smaller than one real slice
+    assert supervisor_module._APPLY_SLICE == 1  # a stop is checked between any two files
     ingest = sup.pipeline.ingest_file
 
     def slow_ingest(path, scan_id):

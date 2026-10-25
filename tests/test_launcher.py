@@ -401,7 +401,7 @@ def test_stop_with_open_sse_stream_exits_within_10s(tmp_path, redirects):
 
 
 def test_stop_waits_for_a_starting_host(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(launcher, "STOP_WAIT_S", 0.6)
+    monkeypatch.setattr(launcher, "START_WAIT_S", 0.6)
     lock = acquire(tmp_path)  # a host that holds the lock but has not written host.json yet
     try:
         started = time.monotonic()
@@ -413,6 +413,66 @@ def test_stop_waits_for_a_starting_host(tmp_path, monkeypatch, capsys):
         gives_up.join()
     finally:
         lock.release()
+
+
+def test_stop_waits_for_the_process_to_exit_and_prints_dots(tmp_path, monkeypatch, capsys):
+    assert launcher.STOP_WAIT_S == 90 and launcher._STOP_DOT_S == 5
+    monkeypatch.setattr(launcher, "STOP_WAIT_S", 0.7)
+    monkeypatch.setattr(launcher, "_STOP_DOT_S", 0.15)
+    lock = acquire(tmp_path)  # a host of this very process: it has exited once it lets go of its lock
+    try:
+        write_running(tmp_path, RunningInfo(os.getpid(), choose_port(0), process_created(os.getpid())))
+        started = time.monotonic()
+        assert stop(tmp_path) == 1  # it never exits: nothing answers the shutdown request, the lock stays
+        out, err = capsys.readouterr()
+        assert time.monotonic() - started >= 0.7 and out.count(".") >= 3 and "still running" in err
+        assert "stopped" not in out
+        exits = threading.Timer(0.4, lock.release)
+        exits.start()
+        assert stop(tmp_path) == 0
+        exits.join()
+        out, _ = capsys.readouterr()
+        assert out.rstrip().endswith("stopped") and "." in out
+    finally:
+        lock.release()
+
+
+def test_read_only_uri_handles_drive_and_unc_paths():
+    assert launcher.read_only_uri(Path(r"C:\Users\me\data\catalog.sqlite")) == (
+        "file:///C:/Users/me/data/catalog.sqlite?mode=ro"
+    )
+    assert launcher.read_only_uri(Path(r"\\server\share\ess data\catalog.sqlite")) == (
+        "file:////server/share/ess%20data/catalog.sqlite?mode=ro"
+    )
+
+
+def test_catalog_on_a_unc_path_is_read(tmp_path):
+    Catalog(tmp_path).close()
+    drive, rest = os.path.splitdrive(str(tmp_path))
+    unc = Path(rf"\\localhost\{drive[0]}$" + rest)  # the same folder through the administrative share
+    try:
+        reachable = unc.is_dir()
+    except OSError:
+        reachable = False
+    if not reachable:
+        pytest.skip(r"the administrative share \\localhost\C$ is not reachable here")
+    assert launcher._read_catalog(unc, "SELECT COUNT(*) FROM projects") == [(0,)]
+
+
+def test_purge_stops_a_host_on_either_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("EMAILSUPERSEARCH_DATA_ROOT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    default = tmp_path / "local" / "eMailSuperSearch"
+    _owned_root(default, projects=0)
+    catalog = Catalog(default)
+    try:
+        catalog.set_setting("data_root", str(tmp_path / "next"))
+    finally:
+        catalog.close()
+    asked: list[list[Path]] = []
+    monkeypatch.setattr(launcher, "stop_any", lambda roots: asked.append(list(roots)) or 1)
+    assert cli.main(["purge", "--yes"]) == 1  # the stub says a host is still running: nothing is removed
+    assert asked == [[tmp_path / "next", default]] and (default / "catalog.sqlite").is_file()
 
 
 def test_cli_stop_also_finds_a_host_on_the_default_root(tmp_path, monkeypatch, redirects):

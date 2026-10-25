@@ -15,7 +15,7 @@ from urllib.parse import quote
 import openpyxl
 import pytest
 
-from emailsupersearch.host import routes_export
+from emailsupersearch.host import routes_export, routes_messages
 from emailsupersearch.host.routes_messages import attachment_disposition
 
 HTML_KEY = "html/1@corpus.example"
@@ -202,11 +202,26 @@ def test_open_route_calls_startfile(client, indexed_project, monkeypatch, corpus
 
 def test_reveal_route_spawns_explorer(client, indexed_project, monkeypatch, corpus_dir):
     spawned = []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kwargs: spawned.append((args, kwargs)))
+
+    class FakeProcess:
+        def __init__(self, args, **kwargs):
+            spawned.append((args, kwargs))
+            self.done = False
+
+        def poll(self):
+            return 0 if self.done else None
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(routes_messages, "_explorers", [])
     r = client.post(_message_url(indexed_project, HTML_KEY, "/reveal"))
     assert r.status_code == 204
-    assert [args for args, _ in spawned] == [["explorer", "/select,", _html_path(corpus_dir)]]
+    # One command line with the path quoted after "/select,", never through a shell.
+    assert [args for args, _ in spawned] == [f'explorer /select,"{_html_path(corpus_dir)}"']
     assert spawned[0][1].get("shell") is not True
+    first = routes_messages._explorers[0]
+    first.done = True  # Explorer exited: the next reveal drops it, and keeps the new one until it exits
+    assert client.post(_message_url(indexed_project, HTML_KEY, "/reveal")).status_code == 204
+    assert first not in routes_messages._explorers and len(routes_messages._explorers) == 1
 
 
 # ---- export ----
@@ -232,7 +247,18 @@ def test_export_route_writes_xlsx(client, indexed_project, host_services, monkey
     monkeypatch.setattr(routes_export, "export_results", locked)
     r = client.post(url, json={"filters": {"query": ""}})
     assert r.status_code == 409
-    assert r.json() == {"error": "the export file is open in another program; close it and retry"}
+    assert r.json() == {"error": routes_export.EXPORT_DENIED}
+    assert "not writable" in routes_export.EXPORT_DENIED and "open in another program" in routes_export.EXPORT_DENIED
+
+
+def test_export_to_a_folder_that_cannot_be_created_is_a_409(client, indexed_project, monkeypatch):
+    class Unwritable:
+        def mkdir(self, parents=False, exist_ok=False):
+            raise PermissionError("access denied")
+
+    monkeypatch.setattr(routes_export, "_export_dir", lambda conn, project: Unwritable())
+    r = client.post(f"/api/projects/{indexed_project}/export/excel", json={"filters": {"query": ""}})
+    assert r.status_code == 409 and r.json() == {"error": routes_export.EXPORT_DENIED}
 
 
 def test_export_of_a_query_holds_its_top_matches_and_says_when_capped(client, indexed_project, monkeypatch):

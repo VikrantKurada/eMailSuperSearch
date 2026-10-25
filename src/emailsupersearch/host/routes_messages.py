@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -142,11 +143,26 @@ def reveal_message(request: Request) -> Response:
     path = _first_live_path(conn, key)
     if sys.platform != "win32":
         raise ApiError(501, "showing files in Explorer is supported on Windows only")
+    # One command line, no shell: Explorer parses its own arguments and wants the path quoted right after
+    # "/select," (a list would quote the whole "/select,<path>" token). A Windows path cannot contain a quote.
     try:
-        subprocess.Popen(["explorer", "/select,", path])
+        process = subprocess.Popen(f'explorer /select,"{path}"')
     except OSError:
         raise ApiError(502, "could not start Explorer") from None
+    _keep(process)
     return Response(status_code=204)
+
+
+_explorers: list[subprocess.Popen] = []  # started Explorer processes, held until they exit
+_explorers_lock = threading.Lock()
+
+
+def _keep(process: subprocess.Popen) -> None:
+    """Hold a reference to ``process`` until it has exited (polled whenever another starts), so it is reaped instead
+    of being garbage-collected while running."""
+    with _explorers_lock:
+        _explorers[:] = [p for p in _explorers if p.poll() is None]
+        _explorers.append(process)
 
 
 def routes() -> list[Route]:

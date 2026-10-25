@@ -97,8 +97,8 @@ Notes:
 
 ## Stop, upgrade, purge
 
-- Stop the host: `python -m emailsupersearch stop`, or "Stop host" in Settings. `stop` waits for the host to finish and says "not running" when there is none.
-- Upgrade: stop the host, upgrade, start it again.
+- Stop the host: `python -m emailsupersearch stop`, or "Stop host" in Settings. `stop` waits up to 90 seconds for the host process to exit, printing a dot every 5 seconds, and then prints "stopped" (or "not running" when there was none, or "still running" if it gave up).
+- Upgrade: stop the host, wait until `stop` prints "stopped", upgrade, start it again. Upgrading while the host still runs fails or leaves a broken install, because Windows will not replace a library a running process has loaded.
 
   ```bat
   %LOCALAPPDATA%\eMailSuperSearch\venv\Scripts\python -m emailsupersearch stop

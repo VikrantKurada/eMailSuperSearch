@@ -56,6 +56,10 @@ _EXPORT_NAME = re.compile(r"export-\d{8}-\d{6}(-\d+)?\.xlsx", re.ASCII)  # alway
 _SETTING_SQL = "SELECT value FROM settings WHERE key = ?"
 _CHAIN_SUBJECTS_SQL = "SELECT chain_id, subject FROM chains WHERE chain_id IN (SELECT value FROM json_each(?))"
 _export_lock = threading.Lock()  # choosing a free name and writing it are one step
+EXPORT_DENIED = (
+    "the export folder is not writable, or the export file is open in another program;"
+    " choose another export folder or close the file, and retry"
+)
 
 
 def _utcnow() -> datetime:
@@ -118,12 +122,12 @@ def export_excel(request: Request) -> JSONResponse:
     }
     with _export_lock:
         directory = _export_dir(conn, project)
-        directory.mkdir(parents=True, exist_ok=True)
-        name = _free_name(directory, _utcnow())
         try:
+            directory.mkdir(parents=True, exist_ok=True)
+            name = _free_name(directory, _utcnow())
             info = export_results(messages, directory / name, chain_subjects=chain_subjects)
         except PermissionError:
-            raise ApiError(409, "the export file is open in another program; close it and retry") from None
+            raise ApiError(409, EXPORT_DENIED) from None
     result: dict[str, Any] = {
         "path": str(info.path),
         "name": name,

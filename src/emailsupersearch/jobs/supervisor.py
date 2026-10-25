@@ -10,7 +10,7 @@ caller's thread for a direct ``prepare``/``run_once`` (the command line), which 
 never overlap.
 
 ``stop`` pre-empts the worker: it is checked before every start-up step, before every queued command, between
-slices of a scan's files and before every OCR job, so closing a project waits for one slice or one job at most.
+a scan's files and before every OCR job, so closing a project waits for one file or one job at most.
 
 INFO and WARNING logs carry counts and exception type names only: never a path, a subject or an address.
 """
@@ -65,7 +65,7 @@ DEFAULT_RECONCILE_INTERVAL_S = 900
 # was closed under it by a stop.
 RETRY_ON_START_PREFIXES = ("timeout", "memory_cap", "worker", "pool closed")
 NETWORK_POLL_DELAY_MS = 30_000  # network shares are polled every 30 s, not every 0.3 s
-_APPLY_SLICE = 50  # files parsed between two checks for a stop
+_APPLY_SLICE = 1  # files parsed between two checks for a stop: one, so a stop never waits on a batch of parses
 _STOP_JOIN_S = 30.0
 _TIMER_JOIN_S = 5.0
 _FREE_RAM_FOR_TWO_WORKERS = 8 * 1024**3

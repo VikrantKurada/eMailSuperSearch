@@ -79,10 +79,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 GRACEFUL_SHUTDOWN_S = 5  # an open event stream is cut off after this long, so a stop never stalls on one
-STOP_WAIT_S = 10.0  # how long stop waits for a starting host to serve, and then for a host to finish
+START_WAIT_S = 10.0  # how long stop waits for a starting host to serve
+# How long stop waits for the host process to exit: a supervisor finishes the file or OCR job it is on, and an upgrade
+# must not replace DLLs the process still has loaded.
+STOP_WAIT_S = 90.0
 STDERR_LOG = "host-stderr.log"
 
 _STOP_POLL_S = 0.2
+_STOP_DOT_S = 5.0  # while it waits, stop prints a dot this often
 _SHUTDOWN_REQUEST_TIMEOUT_S = 5
 _PURGE_RETRIES = 5  # after the first attempt: six tries in all, 0.2 s apart
 _PURGE_RETRY_S = 0.2
@@ -136,7 +140,7 @@ def _read_catalog(root: Path, sql: str, params: tuple[Any, ...] = ()) -> list[tu
     if not path.is_file():
         return []
     try:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn = sqlite3.connect(read_only_uri(path.resolve()), uri=True)
         try:
             return conn.execute(sql, params).fetchall()
         finally:
@@ -144,6 +148,16 @@ def _read_catalog(root: Path, sql: str, params: tuple[Any, ...] = ()) -> list[tu
     except sqlite3.Error as e:
         log.info("the catalog could not be read: %s", type(e).__name__)
         return []
+
+
+def read_only_uri(path: Path) -> str:
+    """The SQLite URI that opens the absolute ``path`` read-only. A UNC path (``\\\\server\\share\\...``) becomes
+    ``file:////server/share/...``: ``Path.as_uri`` gives ``file://server/share/...``, whose authority SQLite refuses
+    (it accepts none but ``localhost``)."""
+    uri = path.as_uri()
+    if not uri.startswith("file:///"):  # file://server/share/...: move the server into the path
+        uri = "file:////" + uri.removeprefix("file://")
+    return f"{uri}?mode=ro"
 
 
 def _not_ours(root: Path) -> str | None:
@@ -554,14 +568,11 @@ def _purge_on_exit(root: Path, redirected: bool) -> None:
 
 
 def stop(root: Path) -> int:
-    """Ask the host serving ``root`` to shut down and wait for it to finish: 0 when it has (or none was running),
-    1 when it is still running or still starting. A host holding the lock without having written ``host.json`` is
-    starting: ``stop`` waits up to 10 s for it to serve first."""
-    code = _stop_host(root)
-    if code is None:
-        _say("not running")
-        return 0
-    return code
+    """Ask the host serving ``root`` to shut down and wait for its process to exit: 0 when it has, saying "stopped"
+    (or none was running, saying "not running"), 1 when it is still running or still starting. The wait lasts up to
+    ``STOP_WAIT_S`` (90 s) with a dot every 5 s. A host holding the lock without having written ``host.json`` is
+    starting: ``stop`` waits up to ``START_WAIT_S`` for it to serve first."""
+    return stop_any([root])
 
 
 def stop_any(roots: Iterable[Path]) -> int:
@@ -570,6 +581,8 @@ def stop_any(roots: Iterable[Path]) -> int:
     if not codes:
         _say("not running")
         return 0
+    if max(codes) == 0:
+        _say("stopped")
     return max(codes)
 
 
@@ -595,19 +608,46 @@ def _stop_host(root: Path) -> int | None:
             pass
     except OSError as e:  # it may be exiting already; whether it finishes is what counts
         log.info("the shutdown request failed: %s", type(e).__name__)
-    deadline = time.monotonic() + STOP_WAIT_S
-    while not host_exited(root, running):
-        if time.monotonic() >= deadline:
-            _say("still running", err=True)
-            return 1
-        time.sleep(_STOP_POLL_S)
-    return 0
+    return 0 if _await_exit(root, running) else 1
+
+
+def _await_exit(root: Path, running: RunningInfo) -> bool:
+    """Wait up to ``STOP_WAIT_S`` for the host's process to be gone, printing a dot every ``_STOP_DOT_S``; True when it
+    is. On timeout it says "still running"."""
+    started = time.monotonic()
+    dots = 0
+    try:
+        while not host_exited(root, running):
+            waited = time.monotonic() - started
+            if waited >= STOP_WAIT_S:
+                _end_dots(dots)
+                dots = 0
+                _say("still running", err=True)
+                return False
+            if waited >= (dots + 1) * _STOP_DOT_S:
+                dots += 1
+                _dot()
+            time.sleep(_STOP_POLL_S)
+        return True
+    finally:
+        _end_dots(dots)
+
+
+def _dot() -> None:
+    if sys.stdout is not None:
+        print(".", end="", file=sys.stdout, flush=True)
+
+
+def _end_dots(dots: int) -> None:
+    """End the line of dots, if any were printed."""
+    if dots and sys.stdout is not None:
+        print(file=sys.stdout, flush=True)
 
 
 def _await_serving(root: Path) -> RunningInfo | None:
-    """Wait up to ``STOP_WAIT_S`` for a starting host to write ``host.json``; None when it did not, or when it let
+    """Wait up to ``START_WAIT_S`` for a starting host to write ``host.json``; None when it did not, or when it let
     go of the lock instead."""
-    deadline = time.monotonic() + STOP_WAIT_S
+    deadline = time.monotonic() + START_WAIT_S
     while time.monotonic() < deadline:
         time.sleep(_STOP_POLL_S)
         running = read_running(root)

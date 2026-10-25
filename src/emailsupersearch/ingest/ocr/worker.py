@@ -22,7 +22,7 @@ from pathlib import Path
 from PIL import Image
 
 from emailsupersearch.ingest.attachments import MAX_OCR_PAGES, render_pdf_page_png
-from emailsupersearch.ingest.ocr.base import OcrUnavailable, select_engine
+from emailsupersearch.ingest.ocr.base import OcrUnavailable, build_engine
 from emailsupersearch.ingest.parse import parse_file
 from emailsupersearch.logging_setup import redact
 from emailsupersearch.types import ParsedAttachment
@@ -79,7 +79,7 @@ def run_ocr_job(
     """
     message = parse_file(Path(path))
     att = _attachment(message.attachments, ordinal)
-    engine = select_engine(language)
+    engine = build_engine(language)  # this child is the one place an engine is constructed
     if engine is None:
         raise OcrUnavailable(f"no OCR engine for {language!r}")
     deadline = time.monotonic() + time_budget_s

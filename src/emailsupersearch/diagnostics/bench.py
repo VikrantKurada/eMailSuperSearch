@@ -103,11 +103,11 @@ def _ocr_pages_per_s(notes: list[str]) -> float | None:
     None, with a note, when no engine can run or the engine fails; the note never holds recognised text.
     """
     try:
-        from emailsupersearch.ingest.ocr.base import select_engine
+        from emailsupersearch.ingest.ocr.base import build_engine
     except ImportError:
         notes.append(NO_OCR_NOTE)
         return None
-    engine = select_engine("en")
+    engine = build_engine("en")  # bench is a process of its own: it may construct an engine, the host never does
     if engine is None:
         notes.append(NO_OCR_ENGINE_NOTE)
         return None

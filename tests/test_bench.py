@@ -44,6 +44,6 @@ def test_run_bench_counts_unparsable_files_without_logging_their_names(tmp_path,
 
 def test_bench_notes_when_no_engine(monkeypatch):
     monkeypatch.setattr("emailsupersearch.diagnostics.bench.load_default_embedder", lambda threads=4: None)
-    monkeypatch.setattr("emailsupersearch.ingest.ocr.base.select_engine", lambda language: None)
+    monkeypatch.setattr("emailsupersearch.ingest.ocr.base.build_engine", lambda language: None)
     r = run_bench(None, n_threads=1, vectors=10)
     assert r.ocr_pages_per_s is None and NO_OCR_ENGINE_NOTE in r.notes

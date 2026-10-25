@@ -125,11 +125,19 @@ def _embedding_dir() -> Path | None:
 
 def _sync(args: argparse.Namespace) -> int:
     """Reconcile a project's mail folders and index what changed; with --once, one pass and exit."""
-    root = data_root()
+    # The root the host would run from (the data_root setting included), and never alongside a running host: the
+    # project database has one writer, the host's supervisor.
+    from emailsupersearch.host.launcher import resolve_root
+    from emailsupersearch.host.lock import lock_held
+
+    root = resolve_root()
     reason = validate_data_root(root)
     if reason is not None:
         print(reason, file=sys.stderr)
         return 2
+    if lock_held(root):
+        print("host is running; use the app's Sync now", file=sys.stderr)
+        return 1
     if not (project_dir(root, args.project) / "project.sqlite").is_file():  # sync never creates a project
         print(f"unknown project: {args.project}", file=sys.stderr)
         return 2
@@ -218,10 +226,11 @@ def _purge(args: argparse.Namespace) -> int:
     if not args.yes:
         print("refusing to purge without --yes", file=sys.stderr)
         return 2
-    from emailsupersearch.host.launcher import remove_root, resolve_root, stop
+    from emailsupersearch.host.launcher import remove_root, resolve_root, stop_any
 
     root = resolve_root()
-    if stop(root) != 0:
+    # As `stop` does: the default root too, where the host still runs after a data_root change.
+    if stop_any([root, data_root()]) != 0:
         print("the host did not stop; nothing was removed", file=sys.stderr)
         return 1
     problem = remove_root(root)

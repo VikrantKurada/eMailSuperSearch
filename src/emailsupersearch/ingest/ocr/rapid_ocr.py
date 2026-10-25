@@ -2,37 +2,19 @@
 
 The engine runs only with model files already inside the installed ``rapidocr/models`` directory: they are passed
 by path so rapidocr never downloads one, and ``RapidOcr()`` raises ``OcrUnavailable`` when any is missing.
-rapidocr is imported inside the functions, so importing this module costs nothing where it is absent.
+rapidocr is imported inside the constructor, so importing this module costs nothing where it is absent; only the OCR
+child process constructs one (``base.build_engine``).
 """
 
 from __future__ import annotations
 
 import io
-from importlib import resources
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from emailsupersearch.ingest.ocr.base import OcrUnavailable
-
-_MODEL_GLOBS = {"Det.model_path": "*det*.onnx", "Cls.model_path": "*cls*.onnx", "Rec.model_path": "*rec*.onnx"}
-
-
-def _model_paths() -> dict[str, str]:
-    """The detection, classification and recognition model files bundled with rapidocr; raises ``OcrUnavailable``."""
-    try:
-        models = Path(str(resources.files("rapidocr") / "models"))
-    except (ImportError, TypeError) as e:  # TypeError: a namespace package with no files
-        raise OcrUnavailable("rapidocr is not installed") from e
-    params: dict[str, str] = {}
-    for key, pattern in _MODEL_GLOBS.items():
-        found = sorted(models.glob(pattern)) if models.is_dir() else []
-        if not found:
-            raise OcrUnavailable(f"rapidocr model file missing: {pattern}")
-        params[key] = str(found[0])
-    return params
+from emailsupersearch.ingest.ocr.base import OcrUnavailable, rapid_model_paths
 
 
 def _texts(output: Any) -> list[str]:
@@ -49,7 +31,7 @@ class RapidOcr:
     name = "rapid"
 
     def __init__(self) -> None:
-        params = _model_paths()
+        params = rapid_model_paths()
         try:
             from rapidocr import RapidOCR
 
