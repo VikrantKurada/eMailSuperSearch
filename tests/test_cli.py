@@ -2,13 +2,13 @@ import json
 
 import pytest
 
-from emailsupersearch import cli
+from emailsupersearch import __version__, cli
 from emailsupersearch.cli import main
 
 
 def test_cli_doctor_exits_zero(capsys): assert main(["doctor"]) == 0 and "python_build" in capsys.readouterr().out
 def test_cli_doctor_json(capsys): main(["doctor", "--json"]); assert json.loads(capsys.readouterr().out)["checks"]
-def test_cli_version(capsys): assert main(["--version"]) == 0 and "0.0.1" in capsys.readouterr().out
+def test_cli_version(capsys): assert main(["--version"]) == 0 and __version__ in capsys.readouterr().out
 
 
 @pytest.fixture

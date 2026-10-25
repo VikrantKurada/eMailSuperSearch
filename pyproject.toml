@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "emailsupersearch"
-version = "0.0.1"
+version = "0.1.0"
 description = "Offline, zero-admin e-mail search for Windows."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

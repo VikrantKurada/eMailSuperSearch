@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    permissions:
+      contents: write  # tag builds push the refreshed lock file to its own branch
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the UI
+        run: bash scripts/build_ui.sh
+
+      # The key is the hash of the script that pins the SHA-256 of each model file, so a changed pin refetches.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: packages/models-en/src/emailsupersearch_models_en/data
+          key: models-en-${{ hashFiles('scripts/fetch_models.py') }}
+
+      - name: Fetch the embedding model
+        run: python scripts/fetch_models.py
+
+      # Tests that need the .msg samples skip without them, so a GitHub API rate limit must not fail the build.
+      - name: Fetch the .msg test fixtures
+        run: python scripts/fetch_fixtures.py
+        continue-on-error: true
+
+      - name: Install
+        run: |
+          python -m pip install -e ".[dev,ocr]" -e packages/models-en --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Build the wheels
+        run: |
+          python -m build --wheel -o dist .
+          python -m build --wheel -o dist packages/models-en
+
+      # --ignore-installed makes pip resolve everything again, so the check also sees the packages the editable
+      # install above already put in this environment.
+      - name: Check that the documented install line resolves to wheels
+        run: |
+          python -m pip install --dry-run --ignore-installed --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console --find-links dist --report "$RUNNER_TEMP/report.json" "emailsupersearch[all]"
+          python -c "import json, os; r = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'report.json'), encoding='utf-8')); bad = [i['metadata']['name'] for i in r['install'] if not i['download_info']['url'].endswith('.whl') and i['metadata']['name'].lower().replace('_', '-') not in ('red-black-tree-mod', 'win-unicode-console')]; assert not bad, 'packages that would build from source: ' + ', '.join(bad); print(len(r['install']), 'packages resolve to wheels, except the two named source archives')"
+
+      - name: Check the size of the UI bundle
+        run: |
+          size=$(du -sb src/emailsupersearch/ui/dist | cut -f1)
+          echo "ui/dist is $size bytes"
+          test "$size" -lt 5242880
+
+      - name: Freeze the lock file
+        run: python -m pip freeze --exclude-editable > "requirements-lock-${{ matrix.python }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: requirements-lock-${{ matrix.python }}
+          path: requirements-lock-${{ matrix.python }}.txt
+
+      - name: Commit the lock file (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "requirements-lock-${{ matrix.python }}.txt"
+          if git diff --cached --quiet; then
+            echo "the lock file is unchanged"
+          else
+            git commit -m "chore: lock file for Python ${{ matrix.python }} at ${GITHUB_REF_NAME}" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+            git push origin "HEAD:refs/heads/lock/${GITHUB_REF_NAME}-py${{ matrix.python }}"
+          fi
