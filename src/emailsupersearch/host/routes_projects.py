@@ -176,6 +176,7 @@ def create_project(request: Request) -> JSONResponse:
     name = _field(body, "name", str)
     folders = _field(body, "folders", list)
     language = _field(body, "language", str, "en")
+    ocr_enabled = _field(body, "ocr_enabled", bool, True)
     for index, folder in enumerate(folders):
         if not _is_folder(folder):
             raise ApiError(400, f"folders[{index}] is not an existing folder")
@@ -187,6 +188,7 @@ def create_project(request: Request) -> JSONResponse:
             language,
             embedder_id=embedder.id if embedder is not None else None,
             embedding_dim=MODEL_DIM if embedder is not None else None,
+            ocr_enabled=ocr_enabled,  # stored before the supervisor below is built, so its first scan honours it
         )
     except ValueError as e:  # a blank name
         raise ApiError(400, str(e)) from None

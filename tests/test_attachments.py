@@ -125,7 +125,8 @@ def test_image_needs_ocr():
 def test_small_cid_image_skipped_large_cid_image_ocrd():
     small = att_png(write_text_png("logo"))
     small.content_id = "logo@x"
-    assert extract_text(small).reason == "inline_image"
+    skipped = extract_text(small)
+    assert (skipped.status, skipped.reason, skipped.text, skipped.needs_ocr_pages) == ("skipped", "inline_image", "", [])
     big = att_png(noisy_png(INLINE_IMAGE_MIN_BYTES + 1))
     big.content_id = "scan@x"
     assert big.size > INLINE_IMAGE_MIN_BYTES and extract_text(big).status == "needs_ocr"

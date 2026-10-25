@@ -101,8 +101,10 @@ class Catalog:
         language: str = "en",
         embedder_id: str | None = None,
         embedding_dim: int | None = None,
+        ocr_enabled: bool = True,
     ) -> Project:
-        """Create a project: its directory, its ``project.sqlite`` with the default settings and the watched folders.
+        """Create a project: its directory, its ``project.sqlite`` with the default settings (``ocr_enabled`` as given)
+        and the watched folders.
 
         The store used to set it up is closed before this returns; open the project's own through ``open_store``.
         When any step fails, the half-built project directory is removed and the error is re-raised.
@@ -123,7 +125,7 @@ class Catalog:
                     ("embedding_dim", embedding_dim),
                     ("chunker_version", CHUNKER_VERSION),
                     ("reconcile_interval_s", 900),
-                    ("ocr_enabled", True),
+                    ("ocr_enabled", ocr_enabled),
                     ("ocr_engine_order", ["windows", "rapid"]),
                     ("group_by_chain_default", True),
                     ("export_dir", None),

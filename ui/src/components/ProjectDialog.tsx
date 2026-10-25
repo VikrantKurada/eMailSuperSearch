@@ -44,20 +44,14 @@ export function ProjectDialog({ api, heading, onCreated, onCancel }: Props) {
     setError(null);
     let project: Project;
     try {
-      project = await api.createProject({ name: name.trim(), folders: all });
+      // The OCR choice travels with the create, so the project's first scan already honours it.
+      project = await api.createProject({ name: name.trim(), folders: all, ocr_enabled: ocr });
     } catch (e) {
       setError(errorText(e));
       setBusy(false);
       return;
     }
-    // The project exists now: a failure to apply the OCR choice is reported, not a reason to create it again.
-    let warning: string | null = null;
-    try {
-      await api.putProjectSettings(project.id, { ocr_enabled: ocr });
-    } catch (e) {
-      warning = `The OCR setting was not applied: ${errorText(e)}`;
-    }
-    onCreated(project, warning);
+    onCreated(project, null);
   };
 
   return (

@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 AttachmentKind = Literal["pdf", "docx", "xlsx", "pptx", "image", "msg", "eml", "other"]
-AttachmentStatus = Literal["ok", "needs_ocr", "unsupported", "failed", "partial"]
+# "skipped": not content at all (an inline logo or signature image), so it is neither indexed nor reported missing.
+AttachmentStatus = Literal["ok", "needs_ocr", "unsupported", "failed", "partial", "skipped"]
 
 
 @dataclass(frozen=True)

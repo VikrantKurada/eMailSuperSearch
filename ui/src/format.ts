@@ -56,6 +56,11 @@ export function attachmentBadges(attachment: AttachmentInfo): string[] {
   return badges;
 }
 
+/** The attachments worth showing: an inline image the host skipped (a logo or signature) is left out. */
+export function shownAttachments(attachments: AttachmentInfo[]): AttachmentInfo[] {
+  return attachments.filter((attachment) => attachment.extract_status !== "skipped");
+}
+
 /** A `YYYY-MM-DD` date input value as epoch seconds: the local day's first second, or its last when `endOfDay`. */
 export function dateInputToTs(value: string, endOfDay: boolean): number | null {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);

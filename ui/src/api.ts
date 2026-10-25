@@ -78,7 +78,7 @@ export class Api {
     return this.request("GET", projectPath(id));
   }
 
-  createProject(body: { name: string; folders: string[]; language?: string }): Promise<Project> {
+  createProject(body: { name: string; folders: string[]; language?: string; ocr_enabled?: boolean }): Promise<Project> {
     return this.request("POST", "/api/projects", body);
   }
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import type { Dispatch } from "preact/hooks";
 import type { Api } from "../api";
-import { attachmentBadges, errorText, formatDate, formatDateTime, personName } from "../format";
+import { attachmentBadges, errorText, formatDate, formatDateTime, personName, shownAttachments } from "../format";
 import type { Action } from "../state";
 import type { MessageDetail, Person } from "../types";
 
@@ -27,6 +27,7 @@ export function MessageViewer({ projectId, messageKey, api, dispatch }: Props) {
 
   const close = () => dispatch({ type: "select", key: null });
   const message = detail?.message;
+  const attachments = detail ? shownAttachments(detail.attachments) : [];
 
   return (
     <aside class="drawer" aria-label="Email viewer">
@@ -71,11 +72,11 @@ export function MessageViewer({ projectId, messageKey, api, dispatch }: Props) {
             <pre class="message-text">{message.body_text ?? ""}</pre>
           )}
 
-          {detail.attachments.length > 0 && (
+          {attachments.length > 0 && (
             <section>
               <h3 class="pane-heading">Attachments</h3>
               <ul class="attachments">
-                {detail.attachments.map((attachment) => (
+                {attachments.map((attachment) => (
                   <li key={attachment.ordinal}>
                     <a href={api.attachmentUrl(projectId, messageKey, attachment.ordinal)} download>
                       📎 {attachment.filename || `attachment ${attachment.ordinal}`}

@@ -604,3 +604,32 @@ def test_mark_ocr_unavailable_spares_an_attachment_already_read(pipeline_with_qu
     pipeline.attach_ocr_text(sha, 0, "zebra crossing report")
     pipeline.mark_ocr_unavailable(sha, 0)  # a stale failure of the same attachment
     assert ocr_status() == "ok"
+
+
+def test_a_signature_logo_is_skipped_not_reported_missing(pipeline, tmp_path):
+    import io
+    import random
+
+    from PIL import Image
+
+    folder = tmp_path / "logo"
+    folder.mkdir()
+    buf = io.BytesIO()
+    Image.frombytes("RGB", (90, 80), random.Random(1).randbytes(90 * 80 * 3)).save(buf, "PNG")
+    logo = buf.getvalue()
+    assert 15_000 < len(logo) < 100 * 1024  # a 20 KB logo: under the inline-image limit
+    msg = EmailMessage()
+    msg["From"] = "Alice <alice@corp.example>"
+    msg["To"] = "owner@corp.example"
+    msg["Subject"] = "Quarterly numbers"
+    msg["Message-ID"] = "<logo-probe-1@corp.example>"
+    msg["Date"] = "Mon, 05 Oct 2026 10:00:00 +0000"
+    msg.set_content("Hi, the quarterly numbers look fine.\n\nAlice")
+    msg.add_alternative('<p>Hi, the quarterly numbers look fine.</p><p>Alice<br><img src="cid:logo1"></p>', subtype="html")
+    msg.get_payload()[1].add_related(logo, "image", "png", cid="<logo1>", filename="image001.png")
+    (folder / "a.eml").write_bytes(bytes(msg))
+    [outcome] = pipeline.apply_scan(_scan(pipeline, folder))
+    assert (outcome.status, outcome.reason, outcome.ocr_jobs) == ("indexed", "", 0)
+    rows = [tuple(r) for r in pipeline.store.conn.execute("SELECT filename, kind, extract_status FROM attachments")]
+    assert rows == [("image001.png", "image", "skipped")]
+    assert pipeline.store.counts()["metadata_only"] == 0

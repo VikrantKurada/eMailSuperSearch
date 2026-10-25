@@ -662,7 +662,9 @@ class ProjectStore:
     # ---- counts ----
 
     def counts(self) -> dict[str, int]:
-        """Row counts for the status screen; ``metadata_only`` messages are searchable by header fields only."""
+        """Row counts for the status screen. ``metadata_only`` counts the messages searchable by header fields only:
+        those with no body chunk (no text could be extracted from the body), or whose file failed to parse. An
+        attachment that could not be read does not make its message metadata-only."""
         with self._lock:
             row = self.conn.execute(
                 "SELECT"
@@ -671,8 +673,7 @@ class ProjectStore:
                 " (SELECT COUNT(*) FROM files WHERE tombstoned_at IS NULL),"
                 " (SELECT COUNT(*) FROM files WHERE tombstoned_at IS NOT NULL),"
                 " (SELECT COUNT(*) FROM messages m"
-                "  WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.message_key = m.message_key)"
-                "  OR EXISTS (SELECT 1 FROM files f WHERE f.message_key = m.message_key"
-                "             AND f.parse_status IN ('failed', 'indexed_partial')))"
+                "  WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.message_key = m.message_key AND c.part = 'body')"
+                "  OR EXISTS (SELECT 1 FROM files f WHERE f.message_key = m.message_key AND f.parse_status = 'failed'))"
             ).fetchone()
         return dict(zip(("messages", "chunks", "files", "tombstoned", "metadata_only"), tuple(row), strict=True))

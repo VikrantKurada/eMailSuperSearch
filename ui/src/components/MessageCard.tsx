@@ -1,6 +1,6 @@
 import type { Dispatch } from "preact/hooks";
 import type { Api } from "../api";
-import { attachmentBadges, errorText, formatDate, personName } from "../format";
+import { attachmentBadges, errorText, formatDate, personName, shownAttachments } from "../format";
 import type { Action } from "../state";
 import type { AttachmentInfo, MessageCard as Message, Person } from "../types";
 
@@ -68,12 +68,13 @@ export function People({ from, to, cc }: { from: Person[]; to: Person[]; cc: Per
   );
 }
 
-/** A card's attachment names with their text-recovery badges. */
+/** A card's attachment names with their text-recovery badges; skipped inline images are not shown. */
 export function Attachments({ attachments }: { attachments: AttachmentInfo[] }) {
-  if (attachments.length === 0) return null;
+  const shown = shownAttachments(attachments);
+  if (shown.length === 0) return null;
   return (
     <ul class="attachments">
-      {attachments.map((attachment) => (
+      {shown.map((attachment) => (
         <li key={attachment.ordinal}>
           <span class="attachment-name">📎 {attachment.filename || `attachment ${attachment.ordinal}`}</span>
           {attachmentBadges(attachment).map((badge) => (

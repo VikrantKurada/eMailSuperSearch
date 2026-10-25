@@ -116,3 +116,17 @@ def test_read_json_needs_a_sync_endpoint_and_has_an_async_twin():
     with pytest.raises(RuntimeError, match="sync endpoint"):
         read_json(Request(scope, receive))
     assert asyncio.run(read_json_async(Request(scope, receive))) == {"a": 1}
+
+
+def test_create_project_takes_the_ocr_choice_before_its_supervisor_starts(client, corpus_dir, host_services):
+    body = {"name": "No OCR", "folders": [str(corpus_dir)], "ocr_enabled": False}
+    assert client.post("/api/projects", json={**body, "ocr_enabled": "no"}).status_code == 400
+    r = client.post("/api/projects", json=body)
+    assert r.status_code == 201
+    pid = r.json()["id"]
+    sup = host_services.supervisors[pid]
+    assert sup.store.get_setting("ocr_enabled") is False
+    assert sup.ocr_runner is None and sup.pipeline.enqueue_ocr is None  # built without OCR from the start
+    assert client.get(f"/api/projects/{pid}/settings").json()["ocr_enabled"] is False
+    default = client.post("/api/projects", json={"name": "Default", "folders": [str(corpus_dir)]}).json()["id"]
+    assert host_services.supervisors[default].store.get_setting("ocr_enabled") is True

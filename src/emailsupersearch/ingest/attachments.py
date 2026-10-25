@@ -2,7 +2,8 @@
 
 ``extract_text`` is the single entry point and never raises: a file over the size cap, an encrypted PDF,
 a corrupt Office document or a type we do not read each come back as an ``AttachmentText`` whose
-``status`` and ``reason`` say what happened. Scanned PDF pages and images are only *flagged*
+``status`` and ``reason`` say what happened. A small inline image (a logo or signature) is ``skipped``: it is not
+content, so it is neither read nor counted as text that could not be extracted. Scanned PDF pages and images are only *flagged*
 (``needs_ocr`` plus the page numbers); the OCR step reads them later, through ``render_pdf_page_png``.
 """
 
@@ -185,7 +186,7 @@ _EXTRACTORS: dict[str, Callable[[ParsedAttachment], _Extracted]] = {
 
 def _extract(att: ParsedAttachment) -> _Extracted:
     if att.kind == "image" and att.content_id is not None and att.size < INLINE_IMAGE_MIN_BYTES:
-        return _Extracted("unsupported", reason="inline_image")
+        return _Extracted("skipped", reason="inline_image")
     extractor = _EXTRACTORS.get(att.kind)
     if extractor is None:
         return _Extracted("unsupported", reason="unsupported_type")

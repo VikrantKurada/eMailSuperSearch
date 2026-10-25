@@ -69,7 +69,8 @@ CHUNK_TRUNCATED_NOTE = "chunk text truncated"
 
 _EMBED_BATCH = 32
 _REASON_MAX_CHARS = 200
-_NOT_INDEXED = ("unsupported", "failed")  # attachment statuses that make the file ``indexed_partial``
+# Attachment statuses that make the file ``indexed_partial``; a ``skipped`` inline image never does.
+_NOT_INDEXED = ("unsupported", "failed")
 
 _EARLIER_IN_CHAIN = "SELECT 1 FROM messages WHERE chain_id = ? AND message_key != ? AND sent_ts < ? LIMIT 1"
 _OTHER_IN_CHAIN = "SELECT 1 FROM messages WHERE chain_id = ? AND message_key != ? LIMIT 1"

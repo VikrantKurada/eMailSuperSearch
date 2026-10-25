@@ -561,20 +561,23 @@ def test_delete_message_removes_chunks_and_vec_rows(tmp_store, parsed_factory, c
 def test_counts_metadata_only(tmp_store, parsed_factory, corpus_dir):
     root = str(corpus_dir)
     assert tmp_store.counts() == {"messages": 0, "chunks": 0, "files": 0, "tombstoned": 0, "metadata_only": 0}
-    for key in ("ok", "empty", "partial", "failed"):
+    for key in ("ok", "empty", "partial", "failed", "att-only"):
         tmp_store.upsert_message(parsed_factory(message_id=f"<{key}@example.com>"), key, "t", None, 0)
     tmp_store.replace_chunks("ok", "body", _chunks("one", "two"))
     tmp_store.replace_chunks("partial", "body", _chunks("three"))
     tmp_store.replace_chunks("failed", "body", _chunks("four"))
-    # "empty" has no chunks; "partial" and "failed" have chunks but a file row that says the parse was not clean
+    tmp_store.replace_chunks("att-only", "att:0", _chunks("five"))
+    # "empty" has no chunks and "att-only" no body chunk; "failed" has chunks but its parse failed. "partial" (an
+    # attachment could not be read) has its body text, so it is not metadata-only.
     tmp_store.upsert_file(_rec(os.path.join(root, "ok.eml"), message_key="ok"))
     tmp_store.upsert_file(_rec(os.path.join(root, "empty.eml"), message_key="empty"))
     tmp_store.upsert_file(_rec(os.path.join(root, "partial1.eml"), message_key="partial", parse_status="indexed_partial"))
     tmp_store.upsert_file(_rec(os.path.join(root, "partial2.eml"), message_key="partial", parse_status="indexed_partial"))
     tmp_store.upsert_file(_rec(os.path.join(root, "failed.eml"), message_key="failed", parse_status="failed"))
+    tmp_store.upsert_file(_rec(os.path.join(root, "att-only.eml"), message_key="att-only"))
     tmp_store.upsert_file(_rec(os.path.join(root, "orphan.eml"), message_key=None, parse_status="failed"))
     tmp_store.tombstone([os.path.join(root, "ok.eml"), os.path.join(root, "orphan.eml")], 10)
-    assert tmp_store.counts() == {"messages": 4, "chunks": 4, "files": 4, "tombstoned": 2, "metadata_only": 3}
+    assert tmp_store.counts() == {"messages": 5, "chunks": 5, "files": 5, "tombstoned": 2, "metadata_only": 3}
 
 
 def test_retry_failed_files_resets_only_matching_failures(tmp_store, corpus_dir):
