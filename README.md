@@ -16,6 +16,8 @@ The two packages named in `--no-binary` are pure-Python dependencies of `extract
 
 The full procedure is in [docs/install.md](docs/install.md): requirements, sideloading the model wheel, the first run, where the data lives, an offline bundle for a laptop that cannot reach PyPI, upgrading and purging, and troubleshooting.
 
+If your company's security policy blocks `onnxruntime` (the semantic-search engine), the app still runs with keyword search only. That is the one degraded mode: `sqlite-vec`, `tokenizers` and `pdfium` are hard requirements.
+
 ## Probe (M0)
 
 This section describes the pre-release probe (version 0.0.1), kept for reference; for an ordinary install use the Quick start above. The probe answers, on your own laptop, whether every native dependency loads under your company's security policy and how fast parsing, embedding and nearest-neighbour search run, so the defaults can be set from measurements. Both commands print facts about the machine and speed figures only, never message text.

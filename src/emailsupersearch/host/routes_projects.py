@@ -141,6 +141,18 @@ def _project_id(request: Request) -> str:
 # ---- status ----
 
 
+def _msg_handler_missing(services: Services) -> bool:
+    """Whether the latest recorded doctor run found no ``.msg`` handler (its ``msg_handler`` check is ``warn`` or
+    ``fail``). No run, a report that cannot be read or a report without that check count as not missing."""
+    try:
+        latest = services.catalog.latest_doctor_run()
+        checks = json.loads(latest[1])["checks"] if latest is not None else []
+        found = next((c for c in checks if isinstance(c, dict) and c.get("name") == "msg_handler"), None)
+    except (ValueError, TypeError, KeyError):
+        return False
+    return found is not None and found.get("status") in ("warn", "fail")
+
+
 def status(request: Request) -> JSONResponse:
     services = services_of(request)
     degraded = []
@@ -148,6 +160,8 @@ def status(request: Request) -> JSONResponse:
         degraded.append("embedder")
     if not _ocr_available():
         degraded.append("ocr")
+    if _msg_handler_missing(services):
+        degraded.append("msg_handler")  # Open in Outlook may fail; the UI points to Reveal in Explorer
     projects = []
     for project in services.catalog.list_projects():
         sup = services.supervisors.get(project.id)

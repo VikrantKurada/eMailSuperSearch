@@ -1,10 +1,19 @@
-"""CPU sentence embedder: int8 all-MiniLM-L6-v2 through onnxruntime and the tokenizers library."""
+"""CPU sentence embedder: int8 all-MiniLM-L6-v2 through onnxruntime and the tokenizers library.
 
+onnxruntime and tokenizers are imported only when an embedder is built, so importing this module (for ``MODEL_DIM``,
+say) loads neither. On a machine where onnxruntime is blocked (AppLocker, Smart App Control) ``load_default_embedder``
+therefore answers None and the host and ``sync`` run keyword-only, instead of failing to start.
+"""
+
+from __future__ import annotations
+
+import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
-import onnxruntime as ort
-from tokenizers import Tokenizer
+
+log = logging.getLogger(__name__)
 
 MODEL_ID = "minilm-l6-v2-int8"
 MODEL_DIM = 384
@@ -21,7 +30,7 @@ def tokenizer_path(model_dir: Path) -> Path:
     return model_dir / "tokenizer.json"
 
 
-def _disable_telemetry_once() -> None:
+def _disable_telemetry_once(ort: Any) -> None:
     global _telemetry_disabled
     if not _telemetry_disabled:
         ort.disable_telemetry_events()
@@ -36,10 +45,13 @@ class OnnxEmbedder:
     max_tokens: int = MAX_TOKENS
 
     def __init__(self, model_dir: Path, threads: int = 4) -> None:
+        import onnxruntime as ort  # here, not at the top: see the module docstring
+        from tokenizers import Tokenizer
+
         self._tokenizer = Tokenizer.from_file(str(tokenizer_path(model_dir)))
         self._tokenizer.enable_truncation(max_length=self.max_tokens)
         self._tokenizer.enable_padding()
-        _disable_telemetry_once()
+        _disable_telemetry_once(ort)
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         self._session = ort.InferenceSession(
@@ -69,7 +81,9 @@ class OnnxEmbedder:
 
 
 def load_default_embedder(threads: int = 4) -> OnnxEmbedder | None:
-    """Return the embedder from emailsupersearch-models-en, or None when it is absent or incomplete."""
+    """Return the embedder from emailsupersearch-models-en, or None when it is absent or incomplete, or when
+    onnxruntime or tokenizers cannot be loaded (``ImportError`` or ``OSError``, logged as a WARNING by type only):
+    search is then keyword-only."""
     try:
         import emailsupersearch_models_en as models
     except ImportError:
@@ -77,4 +91,8 @@ def load_default_embedder(threads: int = 4) -> OnnxEmbedder | None:
     model_dir = models.embedding_dir()
     if not model_path(model_dir).is_file() or not tokenizer_path(model_dir).is_file():
         return None
-    return OnnxEmbedder(model_dir, threads=threads)
+    try:
+        return OnnxEmbedder(model_dir, threads=threads)
+    except (ImportError, OSError) as e:
+        log.warning("the embedder could not be loaded, so search is keyword-only: %s", type(e).__name__)
+        return None

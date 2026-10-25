@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/preact";
+import { cleanup, fireEvent, render, screen } from "@testing-library/preact";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Api } from "../api";
 import type { AttachmentInfo, MessageCard as Message } from "../types";
@@ -36,6 +36,14 @@ describe("MessageCard", () => {
     render(<MessageCard message={message} projectId="p1" api={new Api()} dispatch={vi.fn()} pinned={false} />);
     expect(screen.queryByText(/image001\.png/)).toBeNull();
     expect(screen.queryByRole("list")).toBeNull();
+  });
+
+  it("Reveal in Explorer calls the reveal route for the message", () => {
+    const api = new Api();
+    const reveal = vi.spyOn(api, "reveal").mockResolvedValue(undefined);
+    render(<MessageCard message={message} projectId="p1" api={api} dispatch={vi.fn()} pinned={false} />);
+    fireEvent.click(screen.getByRole("button", { name: "Reveal in Explorer" }));
+    expect(reveal).toHaveBeenCalledWith("p1", "<logo-1@corp.example>");
   });
 
   it("shows a real attachment next to it", () => {

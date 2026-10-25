@@ -595,6 +595,7 @@ ul {
 }
 
 .drawer-title {
+  flex: 1; /* the actions stay together at the right */
   font-size: 16px;
 }
 

@@ -102,6 +102,14 @@ export function ChainCard({ chain, projectId, api, dispatch, pinnedChainIds, pin
         >
           Open in Outlook
         </button>
+        <button
+          type="button"
+          class="btn"
+          disabled={lead === null}
+          onClick={() => lead && api.reveal(projectId, lead.message_key).catch(fail)}
+        >
+          Reveal in Explorer
+        </button>
         <button type="button" class="btn" disabled title="Needs the chat milestone">
           Add to chat
         </button>

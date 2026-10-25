@@ -8,6 +8,7 @@ import { ResultsTab } from "./components/ResultsTab";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Tabs } from "./components/Tabs";
 import { errorText } from "./format";
+import { SYNC_POLL_MS, progressBaseline, shouldPollSync, shouldRefreshResults } from "./progress";
 import { initialState, reducer } from "./state";
 import type { Project, SyncStatus } from "./types";
 
@@ -26,7 +27,14 @@ export function App({ api: given }: { api?: Api }) {
   filters.current = state.filters;
   const searchSeq = useRef(0);
   const searchFailed = useRef(false);
+  // Re-running the current search as indexing progresses: a bump of `rerun` repeats it; `pendingAtSearch` holds the
+  // pending file count when it last ran.
+  const [rerun, setRerun] = useState(0);
+  const pendingAtSearch = useRef<number | null>(null);
+  const syncNow = useRef<SyncStatus | null>(null);
+  syncNow.current = sync;
   const { projectId } = state;
+  const polling = shouldPollSync(sync);
 
   // The host status on mount; the first project is selected when there is one.
   useEffect(() => {
@@ -61,11 +69,35 @@ export function App({ api: given }: { api?: Api }) {
       if (live) setSync(JSON.parse((event as MessageEvent<string>).data) as SyncStatus);
     });
     for (const name of REFRESH_EVENTS) source.addEventListener(name, refresh);
+    // A finished scan has indexed what it found: show it in the results.
+    source.addEventListener("scan_finished", () => live && setRerun((n) => n + 1));
     return () => {
       live = false;
       source.close();
     };
   }, [api, projectId, stopped]);
+
+  // While a sync runs (the first index of a large folder takes hours), poll its status every 3 s so the counts move.
+  useEffect(() => {
+    if (projectId === null || stopped || !polling) return;
+    let live = true;
+    const timer = setInterval(() => {
+      api
+        .syncStatus(projectId)
+        .then((s) => live && setSync(s))
+        .catch(() => undefined);
+    }, SYNC_POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [api, projectId, stopped, polling]);
+
+  // Re-run the current search once enough files have been indexed since it ran, so results fill in as indexing goes.
+  useEffect(() => {
+    if (shouldRefreshResults(pendingAtSearch.current, sync)) setRerun((n) => n + 1);
+    else pendingAtSearch.current = progressBaseline(pendingAtSearch.current, sync);
+  }, [sync]);
 
   // The project's group-by-chain default applies when it is opened.
   useEffect(() => {
@@ -85,10 +117,12 @@ export function App({ api: given }: { api?: Api }) {
     };
   }, [api, projectId, stopped]);
 
-  // Search whenever the project, the filters (the query on Enter, the sort included) or the page change.
+  // Search whenever the project, the filters (the query on Enter, the sort included) or the page change, and again
+  // when indexing progress calls for it (`rerun`).
   useEffect(() => {
     if (projectId === null || stopped) return;
     const seq = ++searchSeq.current;
+    pendingAtSearch.current = syncNow.current?.files_pending ?? null;
     dispatch({ type: "setBusy", busy: true });
     api
       .search(projectId, state.filters, state.page)
@@ -106,7 +140,7 @@ export function App({ api: given }: { api?: Api }) {
       .finally(() => {
         if (seq === searchSeq.current) dispatch({ type: "setBusy", busy: false });
       });
-  }, [api, projectId, state.filters, state.page, stopped]);
+  }, [api, projectId, state.filters, state.page, stopped, rerun]);
 
   const created = async (project: Project, warning: string | null) => {
     setDialog(null);

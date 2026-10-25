@@ -12,10 +12,11 @@ type Props = {
   pinned: boolean;
 };
 
-/** One email: its pin checkbox, subject (opens the viewer), people, snippet, attachments and Open in Outlook. */
+/** One email: its pin checkbox, subject (opens the viewer), people, snippet, attachments, Open in Outlook and Reveal. */
 export function MessageCard({ message, projectId, api, dispatch, pinned }: Props) {
-  const open = () =>
-    api.openInOutlook(projectId, message.message_key).catch((e) => dispatch({ type: "setError", error: errorText(e) }));
+  const fail = (e: unknown) => dispatch({ type: "setError", error: errorText(e) });
+  const open = () => api.openInOutlook(projectId, message.message_key).catch(fail);
+  const reveal = () => api.reveal(projectId, message.message_key).catch(fail);
 
   return (
     <article class="card message-card">
@@ -37,6 +38,9 @@ export function MessageCard({ message, projectId, api, dispatch, pinned }: Props
       <div class="actions">
         <button type="button" class="btn primary" onClick={open}>
           Open in Outlook
+        </button>
+        <button type="button" class="btn" onClick={reveal}>
+          Reveal in Explorer
         </button>
       </div>
     </article>

@@ -86,7 +86,7 @@ export type ProjectDetail = Project & { folders: string[] };
 /** The body of `GET /api/status`; `blocked` is the reason a project has no running supervisor, else null. */
 export type Status = {
   version: string;
-  degraded: string[]; // "embedder" and/or "ocr" when that part is unavailable
+  degraded: string[]; // "embedder", "ocr" and/or "msg_handler" (no .msg handler registered) when that part is unavailable
   projects: { id: string; name: string; created_at: number; sync: SyncStatus | null; blocked: string | null }[];
 };
 

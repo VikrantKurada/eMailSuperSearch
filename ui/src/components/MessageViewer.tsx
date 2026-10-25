@@ -26,6 +26,9 @@ export function MessageViewer({ projectId, messageKey, api, dispatch }: Props) {
   }, [api, projectId, messageKey]);
 
   const close = () => dispatch({ type: "select", key: null });
+  const fail = (e: unknown) => dispatch({ type: "setError", error: errorText(e) });
+  const open = () => api.openInOutlook(projectId, messageKey).catch(fail);
+  const reveal = () => api.reveal(projectId, messageKey).catch(fail);
   const message = detail?.message;
   const attachments = detail ? shownAttachments(detail.attachments) : [];
 
@@ -33,6 +36,12 @@ export function MessageViewer({ projectId, messageKey, api, dispatch }: Props) {
     <aside class="drawer" aria-label="Email viewer">
       <div class="drawer-head">
         <h2 class="drawer-title">{message ? message.headers.subject || "(no subject)" : "Email"}</h2>
+        <button type="button" class="btn" disabled={!detail} onClick={open}>
+          Open in Outlook
+        </button>
+        <button type="button" class="btn" disabled={!detail} onClick={reveal}>
+          Reveal in Explorer
+        </button>
         <button type="button" class="btn" onClick={close}>
           Close
         </button>

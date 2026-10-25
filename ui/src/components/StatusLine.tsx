@@ -14,7 +14,12 @@ type Props = {
   dispatch: Dispatch<Action>;
 };
 
-const DEGRADED_BADGES: Record<string, string> = { embedder: "No semantic search", ocr: "No OCR" };
+const DEGRADED_BADGES: Record<string, string> = {
+  embedder: "No semantic search",
+  ocr: "No OCR",
+  msg_handler: "No .msg handler",
+};
+const DEGRADED_TIPS: Record<string, string> = { msg_handler: "Open in Outlook may fail; use Reveal in Explorer" };
 
 /** The sync state and counts, the degraded-mode badges, the last error, and Sync now. Never a modal. */
 export function StatusLine({ status, sync, projectId, busy, error, api, dispatch }: Props) {
@@ -41,7 +46,7 @@ export function StatusLine({ status, sync, projectId, busy, error, api, dispatch
       </div>
       <div class="badges">
         {(status?.degraded ?? []).map((part) => (
-          <span class="badge warn" key={part}>
+          <span class="badge warn" key={part} title={DEGRADED_TIPS[part]}>
             {DEGRADED_BADGES[part] ?? `No ${part}`}
           </span>
         ))}

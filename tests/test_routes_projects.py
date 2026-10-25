@@ -130,3 +130,25 @@ def test_create_project_takes_the_ocr_choice_before_its_supervisor_starts(client
     assert client.get(f"/api/projects/{pid}/settings").json()["ocr_enabled"] is False
     default = client.post("/api/projects", json={"name": "Default", "folders": [str(corpus_dir)]}).json()["id"]
     assert host_services.supervisors[default].store.get_setting("ocr_enabled") is True
+
+
+def test_status_reports_a_missing_msg_handler_from_the_latest_doctor_run(client, host_services):
+    import json
+
+    def degraded():
+        return client.get("/api/status").json()["degraded"]
+
+    def record(checks):
+        host_services.catalog.record_doctor_run(json.dumps({"checks": checks, "degraded": [], "generated_at": 1}))
+
+    assert "msg_handler" not in degraded()  # no doctor run recorded
+    record([{"name": "msg_handler", "status": "warn", "detail": "no .msg handler registered", "remedy": ""}])
+    assert "msg_handler" in degraded()
+    record([{"name": "msg_handler", "status": "ok", "detail": "ProgId Outlook.File.msg.15", "remedy": ""}])
+    assert "msg_handler" not in degraded()  # the latest run wins
+    record([{"name": "msg_handler", "status": "fail", "detail": "", "remedy": ""}])
+    assert "msg_handler" in degraded()
+    host_services.catalog.record_doctor_run("not json")
+    assert "msg_handler" not in degraded()
+    record([{"name": "python_build", "status": "ok", "detail": "", "remedy": ""}])  # no such check: off Windows
+    assert "msg_handler" not in degraded()
