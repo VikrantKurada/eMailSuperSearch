@@ -6,10 +6,10 @@ fixture), so the viewer has a body to sanitise, a Message-ID holding ``/`` and a
 
 import os
 import re
-import subprocess
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import numpy as np
@@ -213,7 +213,9 @@ def test_reveal_route_spawns_explorer(client, indexed_project, monkeypatch, corp
         def poll(self):
             return 0 if self.done else None
 
-    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+    # Patch only the route module's view of subprocess: replacing subprocess.Popen itself would also catch the
+    # project supervisor's OCR spawns, which run on a background thread during this test (CI, Python 3.12).
+    monkeypatch.setattr(routes_messages, "subprocess", SimpleNamespace(Popen=FakeProcess))
     monkeypatch.setattr(routes_messages, "_explorers", [])
     r = client.post(_message_url(indexed_project, HTML_KEY, "/reveal"))
     assert r.status_code == 204
