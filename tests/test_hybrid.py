@@ -219,6 +219,19 @@ def _unit(*weights):
     return v / np.linalg.norm(v)
 
 
+def test_only_the_keyword_list_can_cap_a_query(tmp_store, parsed_factory):
+    rowids = [_seed(tmp_store, parsed_factory, f"filler-{i:02d}", [f"Filler text {i}."])[0] for i in range(30)]
+    rowids += [_seed(tmp_store, parsed_factory, f"walrus-{i}", ["A walrus was seen."])[0] for i in range(2)]
+    VectorIndex(tmp_store.conn).upsert([(rowid, _unit(1, i / 10)) for i, rowid in enumerate(rowids)])
+    embedder = _QueryVector(_unit(1))
+    # k_each 5: the vector list fills its 20 chunks, the keyword list holds 2 messages: nothing more contains "walrus".
+    cards, capped = query_matches(tmp_store, embedder, SearchFilters(query="walrus"), k_each=5)
+    assert {"walrus-0", "walrus-1"} <= {c.message_key for c in cards} and len(cards) > 2 and not capped
+    # k_each 1: the keyword list keeps 1 of its 2 messages, so more emails contain the word than the result holds.
+    _, capped = query_matches(tmp_store, embedder, SearchFilters(query="walrus"), k_each=1)
+    assert capped
+
+
 def test_identifier_query_is_ranked_by_the_keyword_list_alone(tmp_store, parsed_factory):
     exact = _seed(tmp_store, parsed_factory, "z-exact", ["Invoice INV-2031-00042 attached."])
     # A longer text holding the identifier inside a longer one: a weaker trigram hit, but the vector list's favourite.

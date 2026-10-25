@@ -25,7 +25,7 @@ from collections.abc import Hashable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 from emailsupersearch.index.fts import keyword_search, looks_like_identifier
-from emailsupersearch.index.vectors import MAX_K, VectorIndex
+from emailsupersearch.index.vectors import VectorIndex
 from emailsupersearch.ingest.attachments import INLINE_IMAGE_MIN_BYTES
 from emailsupersearch.ingest.identity import normalize_subject
 from emailsupersearch.search.filters import (
@@ -420,30 +420,27 @@ def _top_messages(hits: Sequence[int], keys: dict[int, str], k: int) -> list[str
 def _query_cards(
     conn: sqlite3.Connection, embedder: OnnxEmbedder | None, f: SearchFilters, query: str, k_each: int
 ) -> tuple[list[MessageCard], bool]:
-    """The cards of a query's top matches, best fused score first, and whether a retriever came back full.
+    """The cards of a query's top matches, best fused score first, and whether the keyword retriever came back full.
 
     Each retriever fetches ``CHUNK_FETCH_FACTOR * k_each`` chunks and contributes its best ``k_each`` messages; the
     message rankings are fused with ``rrf``. An identifier query uses the keyword ranking alone. The flag is True when
-    a retriever returned as many chunks as it asked for, or ``k_each`` messages: more matches may exist than these.
+    the keyword retriever (BM25 and trigram) returned as many chunks as it asked for, or ``k_each`` messages: more
+    emails contain the words than these. The vector retriever never sets it: a nearest-neighbour search always fills
+    its quota, so its being full says nothing about how many emails match.
     """
     rowids = chunk_rowids_for(conn, candidate_message_keys(conn, f))
     if rowids == []:
         return [], False
     fetch = CHUNK_FETCH_FACTOR * k_each
     chunk_lists = [[rowid for rowid, _ in keyword_search(conn, query, fetch, rowids)]]
-    caps = [fetch]
     if embedder is not None and not looks_like_identifier(query):
         vector = embedder.embed([query])[0]
         chunk_lists.append([rowid for rowid, _ in VectorIndex(conn).knn(vector, fetch, rowids)])
-        caps.append(min(fetch, MAX_K))
     fetched = list(dict.fromkeys(rowid for hits in chunk_lists for rowid in hits))
     chunk_rows = conn.execute(_CHUNKS_SQL, (json.dumps(fetched),)).fetchall()
     keys = {row[0]: row[1] for row in chunk_rows}
     message_lists = [_top_messages(hits, keys, k_each) for hits in chunk_lists]
-    capped = any(
-        len(hits) >= cap or len(messages) >= k_each
-        for hits, cap, messages in zip(chunk_lists, caps, message_lists, strict=True)
-    )
+    capped = len(chunk_lists[0]) >= fetch or len(message_lists[0]) >= k_each  # the keyword list only
     fused = rrf(message_lists)
     best_chunk = {key: rowid for key, _, rowid in rank_messages(rrf(chunk_lists), chunk_rows)}
     scored = sorted(((key, score, best_chunk[key]) for key, score in fused.items()), key=lambda hit: (-hit[1], hit[0]))
@@ -455,8 +452,9 @@ def _query_cards(
 def query_matches(
     store: ProjectStore, embedder: OnnxEmbedder | None, f: SearchFilters, k_each: int = K_EXPORT
 ) -> tuple[list[MessageCard], bool]:
-    """Every top match of ``f``'s non-empty query as message cards, in ``f.sort`` order, and whether a retriever came
-    back full (more emails may match than these). The Excel export of a query uses it with ``K_EXPORT``."""
+    """Every top match of ``f``'s non-empty query as message cards, in ``f.sort`` order, and whether the keyword
+    retriever came back full (more emails contain the words than these). The Excel export of a query uses it with
+    ``K_EXPORT``."""
     conn = store.read_conn()
     cards, capped = _query_cards(conn, embedder, f, f.query.strip(), k_each)
     return (_newest_first(cards) if f.sort == "date" else cards), capped

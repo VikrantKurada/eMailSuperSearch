@@ -12,11 +12,13 @@ from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import openpyxl
 import pytest
 
 from emailsupersearch.host import routes_export, routes_messages
 from emailsupersearch.host.routes_messages import attachment_disposition
+from emailsupersearch.index.vectors import VectorIndex
 
 HTML_KEY = "html/1@corpus.example"
 HTML_FILE = "zz-html.eml"
@@ -261,13 +263,37 @@ def test_export_to_a_folder_that_cannot_be_created_is_a_409(client, indexed_proj
     assert r.status_code == 409 and r.json() == {"error": routes_export.EXPORT_DENIED}
 
 
-def test_export_of_a_query_holds_its_top_matches_and_says_when_capped(client, indexed_project, monkeypatch):
+class _RandomEmbedder:
+    """Stands in for the embedder: unit vectors from a fixed seed, so the semantic retriever always fills its quota."""
+
+    id = "random"
+    dim = 384
+
+    def embed(self, texts, batch_size=32):
+        vectors = np.random.default_rng(len(texts)).standard_normal((len(texts), 384)).astype(np.float32)
+        return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
+
+def test_export_of_a_query_holds_its_top_matches_and_says_when_capped(client, indexed_project, host_services, monkeypatch):
     url = f"/api/projects/{indexed_project}/export/excel"
     info = client.post(url, json={"filters": {"query": "renewal"}}).json()
     assert info["rows"] > 1 and info["truncated"] is False  # every keyword match fits under K_EXPORT
-    monkeypatch.setattr(routes_export, "K_EXPORT", 1)
+
+    # Hybrid: give every chunk a vector, so the nearest-neighbour search can always fill its quota.
+    store = host_services.supervisors[indexed_project].store
+    with store.lock:
+        rowids = [row[0] for row in store.conn.execute("SELECT id FROM chunks")]
+        VectorIndex(store.conn).upsert(list(zip(rowids, _RandomEmbedder().embed(["x"] * len(rowids)), strict=True)))
+    monkeypatch.setattr(host_services, "embedder", _RandomEmbedder())
     info = client.post(url, json={"filters": {"query": "renewal"}}).json()
-    assert info["rows"] == 1 and info["truncated"] is True
+    assert info["rows"] > 1 and info["truncated"] is False  # a small corpus: nothing is left out
+
+    monkeypatch.setattr(routes_export, "K_EXPORT", 3)  # 12 chunks per retriever, fewer than the corpus holds
+    info = client.post(url, json={"filters": {"query": "hana"}}).json()  # one sender: one keyword match
+    assert info["rows"] > 1 and info["truncated"] is False  # the semantic list came back full; that is no truncation
+    monkeypatch.setattr(routes_export, "K_EXPORT", 1)
+    info = client.post(url, json={"filters": {"query": "renewal"}}).json()  # more keyword matches than the cap
+    assert info["truncated"] is True
 
 
 def test_export_route_uses_pinned_keys_when_present(client, indexed_project, host_services):

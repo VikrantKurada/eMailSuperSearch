@@ -5,7 +5,8 @@
   chains are exported, newest first; otherwise the results of the filters, ungrouped, up to ``EXPORT_MAX_ROWS``: with
   an empty query every matching message, with a query its top matches (``query_matches``, ``K_EXPORT`` messages per
   retriever). Answers ``{"path", "name", "rows", "truncated"}``; ``truncated`` says that more emails match than the
-  workbook holds (the row limit was reached, or a retriever came back full).
+  workbook holds: the row limit was reached, or the keyword retriever came back full (``K_EXPORT`` messages, or as
+  many chunks as it fetched). The semantic retriever always fills its quota, so it never sets the flag.
 - ``GET /api/projects/{id}/exports/{name}``: the workbook ``name``, which must look exactly like a name this module
   makes (``export-YYYYMMDD-HHMMSS[-N].xlsx``), from the same export folder.
 
