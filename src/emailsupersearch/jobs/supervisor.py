@@ -556,16 +556,24 @@ def build_project_supervisor(
 ) -> ProjectSupervisor:
     """Wire a supervisor (with its own parse pool) for one open project from the project's settings.
 
-    When the embedder or the chunker differs from the one the index was built with, ``reindex_required`` is set
-    and the new ones are recorded: the next ``prepare`` rebuilds the index. OCR is wired only when the
-    ``ocr_enabled`` setting is on and an engine can run for the project's ``language``.
+    ``reindex_required`` is set, and the next ``prepare`` rebuilds the index, when an embedder is loaded and its id
+    differs from the recorded ``embedder_id`` (a first install of the models included), or when the chunker version
+    differs. Without an embedder while the index was built with one (the models are installed but their runtime did
+    not load, say onnxruntime blocked by policy), the index and its ``embedder_id`` are kept: search runs keyword-only
+    and the stored vectors wait, unused, for the next start that loads the embedder. ``embedder_id`` is recorded only
+    from a loaded embedder, except that a rebuild without one records None, because it drops every vector. OCR is
+    wired only when the ``ocr_enabled`` setting is on and an engine can run for the project's ``language``.
     """
     language = store.get_setting("language", "en")
-    embedder_id = embedder.id if embedder is not None else None
-    if store.get_setting("embedder_id") != embedder_id or store.get_setting("chunker_version") != CHUNKER_VERSION:
+    stored_id = store.get_setting("embedder_id")
+    embedder_changed = embedder is not None and embedder.id != stored_id
+    chunker_changed = store.get_setting("chunker_version") != CHUNKER_VERSION
+    if embedder is None and stored_id is not None:
+        log.warning("semantic search unavailable; keeping the existing index")
+    if embedder_changed or chunker_changed:
         store.set_setting("reindex_required", True)
-        store.set_setting("embedder_id", embedder_id)
         store.set_setting("chunker_version", CHUNKER_VERSION)
+        store.set_setting("embedder_id", embedder.id if embedder is not None else None)
     ocr = bool(store.get_setting("ocr_enabled", True)) and select_engine(language) is not None
     pipeline = IngestPipeline(
         store,

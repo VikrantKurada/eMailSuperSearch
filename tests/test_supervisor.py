@@ -12,11 +12,14 @@ from helpers import make_eml_bytes, wait_until
 from emailsupersearch.catalog import Catalog
 from emailsupersearch.cli import main
 from emailsupersearch.host.lock import acquire
+from emailsupersearch.ingest.chunker import Chunker
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.jobs import supervisor as supervisor_module
 from emailsupersearch.jobs.queue import claim_next, enqueue, pending_counts
 from emailsupersearch.jobs.supervisor import build_project_supervisor
+from emailsupersearch.search.hybrid import search
+from emailsupersearch.types import SearchFilters
 
 
 def _scan_id(sup) -> int:
@@ -113,6 +116,42 @@ def test_changed_embedder_id_forces_full_reindex(tmp_store, corpus_dir, chunker,
         )
     finally:
         s2.stop()
+
+
+def test_embedder_load_failure_does_not_force_reindex(tmp_store, corpus_dir, chunker, embedder, caplog):
+    tmp_store.set_setting("ocr_enabled", False)
+    s = build_project_supervisor("p", tmp_store, embedder, chunker, corpus_dir.parent / "cache", None)
+    try:
+        s.prepare()
+        s.run_once()
+    finally:
+        s.pipeline.pool.close()  # not s.stop(): that would close the store the next supervisor uses
+    assert tmp_store.get_setting("embedder_id") == "minilm-l6-v2-int8"
+    assert tmp_store.get_setting("reindex_required") is False
+    chunks, vectors = tmp_store.counts()["chunks"], tmp_store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0]
+    assert vectors > 0
+    # The models are installed but their runtime failed to load (say onnxruntime blocked): no embedder this time.
+    with caplog.at_level(logging.WARNING, logger="emailsupersearch"):
+        s2 = build_project_supervisor("p", tmp_store, None, Chunker(None), corpus_dir.parent / "cache", None)
+    try:
+        assert tmp_store.get_setting("reindex_required") is False
+        assert tmp_store.get_setting("embedder_id") == "minilm-l6-v2-int8"
+        assert any(r.getMessage() == "semantic search unavailable; keeping the existing index" for r in caplog.records)
+        s2.prepare()  # nothing to rebuild
+        assert tmp_store.counts()["chunks"] == chunks
+        assert tmp_store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == vectors
+        r = search(tmp_store, None, SearchFilters(query="renewal"))  # keyword-only; the stored vectors are unused
+        assert r.mode == "keyword_only" and r.chains
+    finally:
+        s2.pipeline.pool.close()
+    # A first install of the models (nothing recorded yet) still rebuilds, to embed what is there.
+    tmp_store.set_setting("embedder_id", None)
+    s3 = build_project_supervisor("p", tmp_store, embedder, chunker, corpus_dir.parent / "cache", None)
+    try:
+        assert tmp_store.get_setting("reindex_required") is True
+        assert tmp_store.get_setting("embedder_id") == "minilm-l6-v2-int8"
+    finally:
+        s3.pipeline.pool.close()
 
 
 def test_run_once_after_prepare_reindexes(sup):
