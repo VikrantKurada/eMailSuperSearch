@@ -26,6 +26,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # Everything below runs in a fresh venv outside the checkout: the runner's own Python comes with tools such as
+      # pipx preinstalled, and they must not reach the frozen lock file. Prepending the venv's Scripts folder to
+      # PATH makes every later `python` the venv's.
+      - name: Create a fresh virtual environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/Scripts/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/Scripts/python" -c "import pathlib, sys; print(pathlib.Path(sys.executable).parent)" >> "$GITHUB_PATH"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -50,6 +59,7 @@ jobs:
 
       - name: Install
         run: |
+          python -c "import sys; assert sys.prefix != sys.base_prefix, 'python is not the CI venv'; print('venv:', sys.prefix)"
           python -m pip install -e ".[dev,ocr]" -e packages/models-en --only-binary=:all: --no-binary red-black-tree-mod,win-unicode-console
 
       - name: Test
@@ -74,7 +84,9 @@ jobs:
           test "$size" -lt 5242880
 
       - name: Freeze the lock file
-        run: python -m pip freeze --exclude-editable > "requirements-lock-${{ matrix.python }}.txt"
+        run: |
+          python -c "import sys; assert sys.prefix != sys.base_prefix, 'python is not the CI venv'"
+          python -m pip freeze --exclude-editable > "requirements-lock-${{ matrix.python }}.txt"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -93,7 +93,7 @@ Notes:
 - The lock file lists every package, so `--no-deps` is correct. pip refuses `--platform` together with `--no-binary` unless `--no-deps` is set, which is why it is there.
 - `setuptools` is in the bundle because the two source archives (`red-black-tree-mod`, `win_unicode_console`) are built on the laptop, and `--no-index` leaves pip nowhere else to get a build tool from. The third command fetches the library and the model package themselves, which the lock leaves out. If you built them yourself, copy the two wheels from `dist` into `bundle` instead.
 - The lock was frozen from the build environment, which includes the developer tools (pytest, ruff and so on), so the bundle is about 150 MB and the install uses only part of it.
-- `requirements-lock-3.12.txt` is committed with the repository. The matching 3.13 lock is produced by CI as the `requirements-lock-3.13` artifact of every build (a tag build also pushes it to a `lock/<tag>-py3.13` branch); it is not committed in the repository. For Python 3.13 use that file and change the flags to `--python-version 3.13 --abi cp313`.
+- `requirements-lock-3.12.txt` and `requirements-lock-3.13.txt` are committed with the repository. CI freezes both in a fresh virtual environment on every build (the `requirements-lock-3.12` and `requirements-lock-3.13` artifacts), and a tag build pushes them to `lock/<tag>-py3.12` and `lock/<tag>-py3.13` branches. For Python 3.13 use the 3.13 file and change the flags to `--python-version 3.13 --abi cp313`.
 
 ## Stop, upgrade, purge
 
