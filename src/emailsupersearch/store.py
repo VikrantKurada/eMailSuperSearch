@@ -539,6 +539,20 @@ class ProjectStore:
             rowids.append(cur.lastrowid)
         return rowids
 
+    def unembedded_chunks(self, limit: int, after_rowid: int = 0) -> list[tuple[int, str]]:
+        """Up to ``limit`` ``(id, text)`` of chunks with no vector (``embedded = 0``) that ingest would have embedded:
+        every body chunk, and an attachment's first ``MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT``. In rowid order, after
+        ``after_rowid``, so a caller pages through them."""
+        from emailsupersearch.ingest.chunker import MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT
+
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, text FROM chunks WHERE embedded = 0 AND id > ?"
+                " AND (part = 'body' OR (substr(part, 1, 4) = 'att:' AND idx < ?)) ORDER BY id LIMIT ?",
+                (after_rowid, MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT, limit),
+            ).fetchall()
+        return [(int(r["id"]), r["text"]) for r in rows]
+
     def mark_embedded(self, rowids: list[int]) -> None:
         with self._lock, self.conn:
             self._mark_embedded(rowids)

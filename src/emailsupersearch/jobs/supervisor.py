@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 from emailsupersearch.index.vectors import VectorIndex
 from emailsupersearch.ingest.chunker import CHUNKER_VERSION, Chunker
 from emailsupersearch.ingest.ocr.base import select_engine
@@ -70,6 +72,8 @@ _STOP_JOIN_S = 30.0
 _TIMER_JOIN_S = 5.0
 _FREE_RAM_FOR_TWO_WORKERS = 8 * 1024**3
 _OCR_ERROR_LOG_CHARS = 80
+_BACKFILL_BATCH = 256  # chunks read and embedded at a time when vectors are backfilled
+_EMBED_BATCH = 32
 
 
 @dataclass
@@ -177,8 +181,9 @@ class ProjectSupervisor:
 
     def prepare(self) -> None:
         """Make the project ready to scan: re-queue jobs a crash left running, rebuild the index when
-        ``reindex_required`` is set, and give files that failed for lack of time or memory one more try (they go
-        back to ``pending``, so the next scan parses them again).
+        ``reindex_required`` is set, embed the chunks stored without a vector (``_backfill_vectors``), and give files
+        that failed for lack of time or memory one more try (they go back to ``pending``, so the next scan parses them
+        again).
 
         ``start`` runs it on the worker thread; ``sync --once`` calls it before ``run_once``. Only the first
         successful call does anything, so the retry happens once per supervisor.
@@ -194,6 +199,9 @@ class ProjectSupervisor:
                 return
             if self.store.get_setting("reindex_required", False):
                 self._reindex()
+            self._backfill_vectors()
+            if self._stop_event.is_set():
+                return
             retried = self.store.retry_failed_files(RETRY_ON_START_PREFIXES)
             if retried:
                 log.info("%d files that ran out of time or memory will be parsed again", retried)
@@ -335,6 +343,32 @@ class ProjectSupervisor:
             self.store.set_setting("reindex_required", False)
         finally:
             self._state = "idle"
+
+    def _backfill_vectors(self) -> int:
+        """Embed the chunks indexed while no embedder loaded (``embedded = 0``; the body's, and an attachment's first
+        ``MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT``), ``_BACKFILL_BATCH`` at a time, checking for a stop between batches;
+        returns how many were embedded. Their ``embedder_id`` already matches the embedder that loads later, so
+        nothing else would. A vector that is not finite is skipped: its chunk stays keyword-only until the next start
+        tries again. The caller holds the run lock."""
+        embedder, vectors = self.pipeline.embedder, self.pipeline.vectors
+        if embedder is None or vectors is None:
+            return 0
+        done = after = 0
+        while not self._stop_event.is_set():
+            rows = self.store.unembedded_chunks(_BACKFILL_BATCH, after)
+            if not rows:
+                break
+            after = rows[-1][0]
+            embedded = embedder.embed([text for _, text in rows], batch_size=_EMBED_BATCH)
+            good = [(rowid, vector) for (rowid, _), vector in zip(rows, embedded, strict=True) if np.isfinite(vector).all()]
+            if good:
+                with self.store.lock:
+                    vectors.upsert(good)
+                self.store.mark_embedded([rowid for rowid, _ in good])
+                done += len(good)
+        if done:
+            log.info("%d chunks indexed without the embedder were embedded", done)
+        return done
 
     def _scan_and_drain(self) -> None:
         """One reconcile, then the timer re-armed, then the OCR queue drained."""
@@ -560,20 +594,21 @@ def build_project_supervisor(
     differs from the recorded ``embedder_id`` (a first install of the models included), or when the chunker version
     differs. Without an embedder while the index was built with one (the models are installed but their runtime did
     not load, say onnxruntime blocked by policy), the index and its ``embedder_id`` are kept: search runs keyword-only
-    and the stored vectors wait, unused, for the next start that loads the embedder. ``embedder_id`` is recorded only
-    from a loaded embedder, except that a rebuild without one records None, because it drops every vector. OCR is
-    wired only when the ``ocr_enabled`` setting is on and an engine can run for the project's ``language``.
+    and the stored vectors wait, unused, for the next start that loads the embedder; ``prepare`` then embeds the
+    chunks indexed meanwhile. ``embedder_id`` is recorded only from a loaded embedder, except that a rebuild without
+    one records None, because it drops every vector. OCR is wired only when the ``ocr_enabled`` setting is on and an
+    engine can run for the project's ``language``.
     """
     language = store.get_setting("language", "en")
     stored_id = store.get_setting("embedder_id")
     embedder_changed = embedder is not None and embedder.id != stored_id
     chunker_changed = store.get_setting("chunker_version") != CHUNKER_VERSION
-    if embedder is None and stored_id is not None:
-        log.warning("semantic search unavailable; keeping the existing index")
+    if embedder is None and stored_id is not None and not chunker_changed:  # a changed chunker rebuilds anyway
+        log.warning("semantic search unavailable; the index is kept and will be embedded when the model loads")
     if embedder_changed or chunker_changed:
         store.set_setting("reindex_required", True)
-        store.set_setting("chunker_version", CHUNKER_VERSION)
         store.set_setting("embedder_id", embedder.id if embedder is not None else None)
+        store.set_setting("chunker_version", CHUNKER_VERSION)
     ocr = bool(store.get_setting("ocr_enabled", True)) and select_engine(language) is not None
     pipeline = IngestPipeline(
         store,

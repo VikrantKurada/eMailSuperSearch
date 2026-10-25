@@ -12,7 +12,11 @@ from helpers import make_eml_bytes, wait_until
 from emailsupersearch.catalog import Catalog
 from emailsupersearch.cli import main
 from emailsupersearch.host.lock import acquire
-from emailsupersearch.ingest.chunker import Chunker
+from emailsupersearch.ingest.chunker import (
+    CHUNKER_VERSION,
+    MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT,
+    Chunker,
+)
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.jobs import supervisor as supervisor_module
@@ -136,7 +140,8 @@ def test_embedder_load_failure_does_not_force_reindex(tmp_store, corpus_dir, chu
     try:
         assert tmp_store.get_setting("reindex_required") is False
         assert tmp_store.get_setting("embedder_id") == "minilm-l6-v2-int8"
-        assert any(r.getMessage() == "semantic search unavailable; keeping the existing index" for r in caplog.records)
+        warning = "semantic search unavailable; the index is kept and will be embedded when the model loads"
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [warning]
         s2.prepare()  # nothing to rebuild
         assert tmp_store.counts()["chunks"] == chunks
         assert tmp_store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == vectors
@@ -152,6 +157,45 @@ def test_embedder_load_failure_does_not_force_reindex(tmp_store, corpus_dir, chu
         assert tmp_store.get_setting("embedder_id") == "minilm-l6-v2-int8"
     finally:
         s3.pipeline.pool.close()
+
+
+def _eligible_unembedded(store):
+    """How many chunks ingest would embed, and how many of those have ``embedded = 1``."""
+    eligible = "part = 'body' OR (substr(part, 1, 4) = 'att:' AND idx < ?)"
+    total, embedded = store.conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(embedded), 0) FROM chunks WHERE {eligible}", (MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT,)
+    ).fetchone()
+    return total, embedded
+
+
+def test_backfill_embeds_chunks_indexed_without_embedder(tmp_store, corpus_dir, chunker, embedder, caplog):
+    tmp_store.set_setting("ocr_enabled", False)
+    tmp_store.set_setting("embedder_id", embedder.id)  # the index was built with the model before
+    tmp_store.set_setting("chunker_version", CHUNKER_VERSION)
+    s1 = build_project_supervisor("p", tmp_store, None, Chunker(None), corpus_dir.parent / "cache", None)
+    try:
+        s1.prepare()
+        s1.run_once()  # indexed while the model's runtime failed to load
+    finally:
+        s1.pipeline.pool.close()  # not s1.stop(): that would close the store the next supervisor uses
+    total, embedded = _eligible_unembedded(tmp_store)
+    assert total > 0 and embedded == 0
+    assert tmp_store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == 0
+    query = SearchFilters(query="fiscal outlay sign-off", group_by_chain=False)  # no chunk holds all three words
+    assert search(tmp_store, None, query).total_messages == 0
+
+    s2 = build_project_supervisor("p", tmp_store, embedder, chunker, corpus_dir.parent / "cache", None)
+    try:
+        assert not tmp_store.get_setting("reindex_required", False)  # same model: no rebuild, a backfill
+        with caplog.at_level(logging.INFO, logger="emailsupersearch.jobs.supervisor"):
+            s2.prepare()
+    finally:
+        s2.pipeline.pool.close()
+    assert _eligible_unembedded(tmp_store) == (total, total)
+    assert tmp_store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == total
+    assert any(r.getMessage() == f"{total} chunks indexed without the embedder were embedded" for r in caplog.records)
+    r = search(tmp_store, embedder, query)
+    assert r.mode == "hybrid" and r.total_messages > 0  # the semantic retriever now finds neighbours
 
 
 def test_run_once_after_prepare_reindexes(sup):

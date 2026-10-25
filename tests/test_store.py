@@ -671,3 +671,18 @@ def test_rows_outside_and_their_purge(tmp_store, tmp_path):
     assert tmp_store.purge_tombstoned_outside(roots, 2) == []  # seen in scan 1: not two scans unseen yet
     assert [r.path for r in tmp_store.purge_tombstoned_outside(roots, 3)] == [gone]
     assert tmp_store.get_file(gone) is None and tmp_store.get_file(sibling) is not None
+
+
+def test_unembedded_chunks_pages_through_the_chunks_ingest_would_embed(tmp_store):
+    from emailsupersearch.ingest.chunker import (
+        MAX_EMBEDDED_CHUNKS_PER_ATTACHMENT as cap,
+    )
+
+    body = tmp_store.replace_chunks("m1", "body", _chunks("one", "two", "three"))
+    att = tmp_store.replace_chunks("m1", "att:0", _chunks(*(f"page {i}" for i in range(cap + 2))))
+    tmp_store.mark_embedded([body[1]])
+    wanted = [body[0], body[2], *att[:cap]]  # not the embedded one, not the attachment's chunks past the cap
+    first = tmp_store.unembedded_chunks(2)
+    assert [rowid for rowid, _ in first] == wanted[:2] and first[0][1] == "one"
+    rest = tmp_store.unembedded_chunks(1000, after_rowid=first[-1][0])
+    assert [rowid for rowid, _ in rest] == wanted[2:]
