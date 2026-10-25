@@ -111,6 +111,19 @@ def test_search_and_export_reject_bad_fields(client, project):
     assert client.post("/api/projects/nope/search", json={}).status_code == 404
 
 
+def test_search_route_bounds_page_and_dates(client, indexed_project):
+    url = f"/api/projects/{indexed_project}/search"
+    for body in [{"page": 2**63}, {"page": 10**30}, {"date_from": -1}, {"date_to": 2**63}, {"date_from": 10**30}]:
+        r = client.post(url, json=body)
+        assert r.status_code == 400 and "error" in r.json(), body
+    last = 2**63 - 1
+    for body in [{"query": "", "group_by_chain": False}, {"query": ""}, {"query": "renewal"}]:
+        r = client.post(url, json={**body, "page": last, "page_size": 100, "date_from": 0, "date_to": last})
+        assert r.status_code == 200, body
+        assert r.json()["messages"] == [] and r.json()["chains"] == []
+    assert client.post(f"/api/projects/{indexed_project}/export/excel", json={"filters": {"date_to": 2**64}}).status_code == 400
+
+
 # ---- message viewer ----
 
 
@@ -220,6 +233,15 @@ def test_export_route_writes_xlsx(client, indexed_project, host_services, monkey
     r = client.post(url, json={"filters": {"query": ""}})
     assert r.status_code == 409
     assert r.json() == {"error": "the export file is open in another program; close it and retry"}
+
+
+def test_export_of_a_query_holds_its_top_matches_and_says_when_capped(client, indexed_project, monkeypatch):
+    url = f"/api/projects/{indexed_project}/export/excel"
+    info = client.post(url, json={"filters": {"query": "renewal"}}).json()
+    assert info["rows"] > 1 and info["truncated"] is False  # every keyword match fits under K_EXPORT
+    monkeypatch.setattr(routes_export, "K_EXPORT", 1)
+    info = client.post(url, json={"filters": {"query": "renewal"}}).json()
+    assert info["rows"] == 1 and info["truncated"] is True
 
 
 def test_export_route_uses_pinned_keys_when_present(client, indexed_project, host_services):

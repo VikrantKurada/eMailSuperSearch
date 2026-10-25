@@ -4,6 +4,7 @@ import json
 from emailsupersearch.index.chains import (
     assign_chain,
     chain_depth,
+    fallback_chain_id,
     thread_guid,
     update_chain_row,
 )
@@ -96,7 +97,7 @@ def test_assign_chain_by_references_picks_nearest_ancestor(tmp_store, parsed_fac
         message_id="<r3@example.com>", subject="Unrelated three", in_reply_to="<nobody@example.com>"
     )
     chain_id, depth = assign_chain(tmp_store, unknown, message_key(unknown))
-    assert (chain_id, depth) == ("c-" + message_key(unknown)[:16], 0)
+    assert (chain_id, depth) == (fallback_chain_id(message_key(unknown)), 0)
 
 
 def test_assign_chain_prefers_conversation_index(tmp_store, parsed_factory):
@@ -164,7 +165,7 @@ def test_unrelated_message_gets_new_chain(tmp_store, parsed_factory):
     chains = {chain_1}
     for m in (other_subject, other_people, too_late):
         key, chain_id, depth = _store(tmp_store, m)
-        assert chain_id == "c-" + key[:16]
+        assert chain_id == fallback_chain_id(key)
         assert depth == 0
         chains.add(chain_id)
 
@@ -178,13 +179,13 @@ def test_subject_rule_ignores_empty_subject_and_missing_date(tmp_store, parsed_f
     _, blank_chain, _ = _store(tmp_store, blank)
     key, prefix_chain, depth = _store(tmp_store, prefix_only)
     assert prefix_chain != blank_chain
-    assert (prefix_chain, depth) == ("c-" + key[:16], 0)
+    assert (prefix_chain, depth) == (fallback_chain_id(key), 0)
 
     dated = parsed_factory(message_id="<dated-1@example.com>", subject="Plan", sent_ts=T0)
     undated = parsed_factory(message_id="<dated-2@example.com>", subject="Plan", sent_ts=None)
     _, dated_chain, _ = _store(tmp_store, dated)
     key, undated_chain, depth = _store(tmp_store, undated)
-    assert (undated_chain, depth) == ("c-" + key[:16], 0)
+    assert (undated_chain, depth) == (fallback_chain_id(key), 0)
     assert undated_chain != dated_chain
 
     # The undated message is no candidate for later ones either.
@@ -287,3 +288,36 @@ def test_update_chain_row_participants_distinct_by_address(tmp_store, parsed_fac
         "to": [{"name": "Bob", "addr": "bob@example.org"}],
         "cc": [{"name": "Carol", "addr": "carol@example.net"}],
     }
+
+
+def test_fallback_chain_ids_do_not_collide_for_exchange_message_ids(tmp_store, parsed_factory):
+    # Exchange Message-IDs share a long prefix: the first 16 characters of these two keys are the same.
+    ids = ["<DB9PR03MB1234567890ABCDEF@DB9PR03MB1234.eurprd03.prod.outlook.com>",
+           "<DB9PR03MB1234567890FEDCBA@DB9PR03MB1234.eurprd03.prod.outlook.com>"]
+    keys = [message_key(parsed_factory(message_id=i)) for i in ids]
+    assert keys[0][:16] == keys[1][:16]
+    chains = [_store(tmp_store, parsed_factory(message_id=i, subject=f"Topic {n}"))[1] for n, i in enumerate(ids)]
+    assert chains[0] != chains[1]
+    assert chains == [fallback_chain_id(k) for k in keys]
+    assert all(c.startswith("c-") and len(c) == 18 and set(c[2:]) <= set("0123456789abcdef") for c in chains)
+
+
+def test_eml_thread_index_puts_replies_in_one_chain(tmp_store, tmp_path):
+    import base64
+    from email.message import EmailMessage
+
+    header = bytes(6) + bytes([0xAB]) * 16
+    paths = []
+    for n, index in enumerate((header, header + bytes(5))):
+        m = EmailMessage()
+        m["Subject"] = "Lease" if n == 0 else "Totally different subject"
+        m["From"] = f"Sender {n} <s{n}@example.com>"
+        m["To"] = f"Other {n} <o{n}@example.org>"
+        m["Message-ID"] = f"<thread-{n}@example.com>"
+        m["Thread-Index"] = base64.b64encode(index).decode("ascii")
+        m.set_content("body")
+        path = tmp_path / f"t{n}.eml"
+        path.write_bytes(m.as_bytes())
+        paths.append(path)
+    results = [_store(tmp_store, parse_file(path)) for path in paths]
+    assert [(chain, depth) for _, chain, depth in results] == [("t-" + _guid(0xAB), 0), ("t-" + _guid(0xAB), 1)]

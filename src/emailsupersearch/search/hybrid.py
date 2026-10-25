@@ -1,10 +1,16 @@
 """Hybrid search: keyword and semantic hits over the filtered candidates, fused by rank and turned into cards.
 
 ``search`` asks FTS5 (``keyword_search``) and, when an embedder is loaded, sqlite-vec (``VectorIndex.knn``) for the
-best ``K_EACH`` chunks each, restricted to the chunks of the messages the filters allow. BM25 and cosine scores are
-on different scales, so the two rankings are fused by position only, with reciprocal rank fusion (``rrf``). Each
-message takes the score and the snippet of its best chunk. A message without a live (not tombstoned) file gets no
-card, whatever the candidate filter let through. The cards are optionally grouped into reply chains.
+best ``CHUNK_FETCH_FACTOR * K_EACH`` chunks each, restricted to the chunks of the messages the filters allow. Each
+retriever's chunks are mapped to their messages and only its best ``K_EACH`` messages (by their best chunk) go on,
+so one long message cannot crowd the others out. BM25 and cosine scores are on different scales, so the two message
+rankings are fused by position only, with reciprocal rank fusion (``rrf``); an identifier query (``INV-2024-00017``)
+is ranked by the keyword list alone, because a semantic neighbour must never outrank the exact hit. Each message
+shows the snippet of its best chunk. A message without a live (not tombstoned) file gets no card, whatever the
+candidate filter let through. The cards are optionally grouped into reply chains.
+
+A query's results are therefore its top matches, at most ``K_EACH`` per retriever, and ``total_messages`` counts
+those; only a search with an empty query (filters alone) counts every matching message.
 
 Every read runs on ``ProjectStore.read_conn()``, never on the writer. Every list of keys or ids is bound as ONE
 JSON array parameter and unpacked with ``json_each``, and cards are built with one query per table, not per card.
@@ -14,11 +20,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+import threading
+from collections.abc import Hashable, Sequence
 from typing import TYPE_CHECKING, Literal
 
-from emailsupersearch.index.fts import keyword_search
-from emailsupersearch.index.vectors import VectorIndex
+from emailsupersearch.index.fts import keyword_search, looks_like_identifier
+from emailsupersearch.index.vectors import MAX_K, VectorIndex
 from emailsupersearch.ingest.attachments import INLINE_IMAGE_MIN_BYTES
 from emailsupersearch.ingest.identity import normalize_subject
 from emailsupersearch.search.filters import (
@@ -44,8 +51,12 @@ if TYPE_CHECKING:
 _Mode = Literal["hybrid", "keyword_only"]
 
 RRF_K = 60
-K_EACH = 50
+K_EACH = 50  # messages each retriever contributes to a search
+K_EXPORT = 2000  # messages each retriever contributes to an export of a query
+CHUNK_FETCH_FACTOR = 4  # each retriever fetches this many chunks per message it may keep
 PAGE_SIZE = 20
+# An address on more than this share of the messages (the mailbox owner, a team list) links no chains as related.
+STOP_ADDRESS_SHARE = 0.05
 # A filter-only search grouped by chain groups at most this many of the newest matching messages, so beyond it the
 # chains shown and their count cover only those messages (``total_messages`` still counts every match).
 FILTER_ONLY_GROUP_LIMIT = 2000
@@ -103,17 +114,30 @@ _SUBJECTS_SQL = (
     "SELECT c.chain_id, c.subject FROM chains c WHERE c.chain_id IN (SELECT value FROM json_each(?))"
     f" AND EXISTS (SELECT 1 FROM messages m WHERE m.chain_id = c.chain_id AND {LIVE_MESSAGE_SQL})"
 )
+# The addresses on more than a given number of messages, as sender or ``to``/``cc`` recipient, in one GROUP BY
+# (``!= ''`` also drops NULL). UNION ALL with COUNT(DISTINCT) counts each message once per address, like a UNION, at
+# a quarter of its cost (measured at 100k messages: 0.3 s against 1.4 s).
+_STOP_ADDRESSES_SQL = (
+    "SELECT addr FROM ("
+    "SELECT lower(sender_addr) AS addr, message_key FROM messages WHERE sender_addr != ''"
+    " UNION ALL SELECT lower(addr), message_key FROM recipients WHERE kind IN ('to', 'cc') AND addr != '')"
+    " GROUP BY addr HAVING COUNT(DISTINCT message_key) > ?"
+)
+
+# Per database file: (message count and share when computed, stop addresses). Recomputed when the count changes.
+_stop_cache: dict[str, tuple[int, float, frozenset[str]]] = {}
+_stop_lock = threading.Lock()
 
 
-def rrf(ranked_lists: list[list[int]], k: int = RRF_K) -> dict[int, float]:
+def rrf[Item: Hashable](ranked_lists: Sequence[Sequence[Item]], k: int = RRF_K) -> dict[Item, float]:
     """Reciprocal rank fusion: each id scores the sum of ``1 / (k + rank)`` over the lists it is in, ranks from 1.
 
     Only positions count, so rankings on different scales (BM25, cosine) fuse fairly. An id repeated within one
-    list counts at its best rank.
+    list counts at its best rank. Ids are chunk rowids or message keys.
     """
-    scores: dict[int, float] = {}
+    scores: dict[Item, float] = {}
     for ranked in ranked_lists:
-        seen: set[int] = set()
+        seen: set[Item] = set()
         for rank, item in enumerate(ranked, start=1):
             if item not in seen:
                 seen.add(item)
@@ -294,15 +318,41 @@ def group_chains(cards: list[MessageCard], conn: sqlite3.Connection) -> list[Cha
     return chains
 
 
+def stop_addresses(conn: sqlite3.Connection) -> frozenset[str]:
+    """The lower-cased addresses on more than ``STOP_ADDRESS_SHARE`` of the messages, as sender or ``to``/``cc``.
+
+    In a personal archive the owner is on nearly every message, so sharing that address says nothing, and looking
+    chains up by it reads the whole archive. Computed with one GROUP BY and cached per database file and message
+    count, so it is recomputed only when the count changes.
+    """
+    count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+    database = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "") or str(id(conn))
+    share = STOP_ADDRESS_SHARE
+    with _stop_lock:
+        cached = _stop_cache.get(database)
+    if cached is not None and cached[:2] == (count, share):
+        return cached[2]
+    found = frozenset(row[0] for row in conn.execute(_STOP_ADDRESSES_SQL, (count * share,)).fetchall())
+    with _stop_lock:
+        _stop_cache[database] = (count, share, found)
+    return found
+
+
 def _related(conn: sqlite3.Connection, chains: list[ChainCard]) -> None:
     """Fill each chain's ``related``: up to 3 other chains with a live message that share at least 2 participant
     addresses or an attachment sha256. Participant matches come first, most shared addresses first, then attachment
-    matches."""
+    matches. Stop addresses (``stop_addresses``) do not count: two chains are related by people only when they share
+    at least 2 other addresses."""
+    stop = stop_addresses(conn) if chains else frozenset()
     found: dict[str, list[str]] = {}
     for chain in chains:
-        addrs = sorted({p.addr.strip().lower() for people in chain.participants.values() for p in people})
-        addrs_json = json.dumps([addr for addr in addrs if addr])
-        ids = [row[0] for row in conn.execute(_RELATED_BY_PEOPLE, (addrs_json, addrs_json, chain.chain_id)).fetchall()]
+        addrs = sorted({p.addr.strip().lower() for people in chain.participants.values() for p in people} - stop)
+        addrs = [addr for addr in addrs if addr]
+        ids: list[str] = []
+        if len(addrs) >= 2:
+            addrs_json = json.dumps(addrs)
+            rows = conn.execute(_RELATED_BY_PEOPLE, (addrs_json, addrs_json, chain.chain_id)).fetchall()
+            ids = [row[0] for row in rows]
         by_attachment = (chain.chain_id, INLINE_IMAGE_MIN_BYTES, INLINE_IMAGE_MIN_BYTES, chain.chain_id)
         ids += [row[0] for row in conn.execute(_RELATED_BY_ATTACHMENT, by_attachment).fetchall()]
         found[chain.chain_id] = list(dict.fromkeys(ids))[:_MAX_RELATED]
@@ -355,6 +405,63 @@ def _filter_only(conn: sqlite3.Connection, f: SearchFilters, page: int, page_siz
     return _grouped(conn, cards, total, page, page_size, mode, by_date=True)
 
 
+def _top_messages(hits: Sequence[int], keys: dict[int, str], k: int) -> list[str]:
+    """The distinct messages of ``hits`` (chunk rowids, best first), each at the rank of its best chunk; at most ``k``."""
+    found: dict[str, None] = {}
+    for rowid in hits:
+        key = keys.get(rowid)
+        if key is not None and key not in found:
+            found[key] = None
+            if len(found) == k:
+                break
+    return list(found)
+
+
+def _query_cards(
+    conn: sqlite3.Connection, embedder: OnnxEmbedder | None, f: SearchFilters, query: str, k_each: int
+) -> tuple[list[MessageCard], bool]:
+    """The cards of a query's top matches, best fused score first, and whether a retriever came back full.
+
+    Each retriever fetches ``CHUNK_FETCH_FACTOR * k_each`` chunks and contributes its best ``k_each`` messages; the
+    message rankings are fused with ``rrf``. An identifier query uses the keyword ranking alone. The flag is True when
+    a retriever returned as many chunks as it asked for, or ``k_each`` messages: more matches may exist than these.
+    """
+    rowids = chunk_rowids_for(conn, candidate_message_keys(conn, f))
+    if rowids == []:
+        return [], False
+    fetch = CHUNK_FETCH_FACTOR * k_each
+    chunk_lists = [[rowid for rowid, _ in keyword_search(conn, query, fetch, rowids)]]
+    caps = [fetch]
+    if embedder is not None and not looks_like_identifier(query):
+        vector = embedder.embed([query])[0]
+        chunk_lists.append([rowid for rowid, _ in VectorIndex(conn).knn(vector, fetch, rowids)])
+        caps.append(min(fetch, MAX_K))
+    fetched = list(dict.fromkeys(rowid for hits in chunk_lists for rowid in hits))
+    chunk_rows = conn.execute(_CHUNKS_SQL, (json.dumps(fetched),)).fetchall()
+    keys = {row[0]: row[1] for row in chunk_rows}
+    message_lists = [_top_messages(hits, keys, k_each) for hits in chunk_lists]
+    capped = any(
+        len(hits) >= cap or len(messages) >= k_each
+        for hits, cap, messages in zip(chunk_lists, caps, message_lists, strict=True)
+    )
+    fused = rrf(message_lists)
+    best_chunk = {key: rowid for key, _, rowid in rank_messages(rrf(chunk_lists), chunk_rows)}
+    scored = sorted(((key, score, best_chunk[key]) for key, score in fused.items()), key=lambda hit: (-hit[1], hit[0]))
+    shown = {rowid for _, _, rowid in scored}
+    snippets = {row[0]: _snippet(row[2]) for row in chunk_rows if row[0] in shown}
+    return build_message_cards(conn, scored, snippets), capped
+
+
+def query_matches(
+    store: ProjectStore, embedder: OnnxEmbedder | None, f: SearchFilters, k_each: int = K_EXPORT
+) -> tuple[list[MessageCard], bool]:
+    """Every top match of ``f``'s non-empty query as message cards, in ``f.sort`` order, and whether a retriever came
+    back full (more emails may match than these). The Excel export of a query uses it with ``K_EXPORT``."""
+    conn = store.read_conn()
+    cards, capped = _query_cards(conn, embedder, f, f.query.strip(), k_each)
+    return (_newest_first(cards) if f.sort == "date" else cards), capped
+
+
 def search(
     store: ProjectStore,
     embedder: OnnxEmbedder | None,
@@ -365,28 +472,17 @@ def search(
     """One page of results for ``f``: chain cards when ``f.group_by_chain``, else message cards.
 
     Without an embedder only the keyword ranking is used (``mode == "keyword_only"``). ``f.sort == "date"`` orders
-    the fused results by date, newest first; otherwise they are ordered by fused score. An empty query lists the
-    filtered messages by date instead. The totals count every surviving message and chain, not just the page
-    (``_filter_only`` notes the one cap on an empty query's chain total).
+    the fused results by date, newest first; otherwise they are ordered by fused score. A query's totals count its
+    top matches (at most ``K_EACH`` messages per retriever) and their chains, not every email that contains the
+    words. An empty query lists the filtered messages by date instead, and its totals count every match
+    (``_filter_only`` notes the one cap on its chain total).
     """
     conn = store.read_conn()
     mode: _Mode = "hybrid" if embedder is not None else "keyword_only"
     query = f.query.strip()
     if not query:
         return _filter_only(conn, f, page, page_size, mode)
-    rowids = chunk_rowids_for(conn, candidate_message_keys(conn, f))
-    if rowids == []:
-        return SearchResponse(0, 0, page, page_size, [], [], mode)
-    ranked = [[rowid for rowid, _ in keyword_search(conn, query, K_EACH, rowids)]]
-    if embedder is not None:
-        vector = embedder.embed([query])[0]
-        ranked.append([rowid for rowid, _ in VectorIndex(conn).knn(vector, K_EACH, rowids)])
-    fused = rrf(ranked)
-    chunk_rows = conn.execute(_CHUNKS_SQL, (json.dumps(list(fused)),)).fetchall()
-    scored = rank_messages(fused, chunk_rows)
-    best = {rowid for _, _, rowid in scored}
-    snippets = {row[0]: _snippet(row[2]) for row in chunk_rows if row[0] in best}
-    cards = build_message_cards(conn, scored, snippets)
+    cards, _ = _query_cards(conn, embedder, f, query, K_EACH)
     if f.sort == "date":
         cards = _newest_first(cards)
     if f.group_by_chain:

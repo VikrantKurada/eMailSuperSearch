@@ -2,8 +2,10 @@
 
 - ``POST /api/projects/{id}/export/excel`` with ``{"filters": {...}, "pinned_keys": [...], "pinned_chain_ids": [...]}``
   (both lists optional): when either list is non-empty the pinned messages and every live message of the pinned
-  chains are exported, newest first; otherwise every result of the filters, ungrouped, up to ``EXPORT_MAX_ROWS``.
-  Answers ``{"path", "name", "rows", "truncated"}``.
+  chains are exported, newest first; otherwise the results of the filters, ungrouped, up to ``EXPORT_MAX_ROWS``: with
+  an empty query every matching message, with a query its top matches (``query_matches``, ``K_EXPORT`` messages per
+  retriever). Answers ``{"path", "name", "rows", "truncated"}``; ``truncated`` says that more emails match than the
+  workbook holds (the row limit was reached, or a retriever came back full).
 - ``GET /api/projects/{id}/exports/{name}``: the workbook ``name``, which must look exactly like a name this module
   makes (``export-YYYYMMDD-HHMMSS[-N].xlsx``), from the same export folder.
 
@@ -36,7 +38,13 @@ from emailsupersearch.host.routes_projects import (
     supervisor_or_409,
 )
 from emailsupersearch.host.routes_search import json_object, parse_filters, str_list
-from emailsupersearch.search.hybrid import cards_for_keys, chain_member_keys, search
+from emailsupersearch.search.hybrid import (
+    K_EXPORT,
+    cards_for_keys,
+    chain_member_keys,
+    query_matches,
+    search,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -94,11 +102,14 @@ def export_excel(request: Request) -> JSONResponse:
         for chain_id in dict.fromkeys(pinned_chain_ids):
             keys += chain_member_keys(conn, chain_id)
         messages = _newest_first(cards_for_keys(conn, keys))
+        total, capped = len(messages), False
+    elif filters.query.strip():
+        messages, capped = query_matches(sup.store, services.embedder, filters, k_each=K_EXPORT)
         total = len(messages)
     else:
         unpaged = replace(filters, group_by_chain=False)
         response = search(sup.store, services.embedder, unpaged, page=0, page_size=EXPORT_MAX_ROWS)
-        messages, total = response.messages, response.total_messages
+        messages, total, capped = response.messages, response.total_messages, False
     chain_ids = sorted({card.chain_id for card in messages if card.chain_id})
     chain_subjects = {
         chain_id: subject
@@ -117,7 +128,7 @@ def export_excel(request: Request) -> JSONResponse:
         "path": str(info.path),
         "name": name,
         "rows": info.rows,
-        "truncated": info.truncated or total > info.rows,
+        "truncated": info.truncated or capped or total > info.rows,
     }
     return JSONResponse(result)
 

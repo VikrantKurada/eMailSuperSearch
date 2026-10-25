@@ -5,6 +5,8 @@ New Outlook saves dragged mail as ``.eml``. Only the stdlib ``email`` package is
 
 from __future__ import annotations
 
+import base64
+import binascii
 import email
 import email.policy
 import re
@@ -18,6 +20,7 @@ from emailsupersearch.ingest.attachments import kind_for
 from emailsupersearch.types import ParsedAttachment, ParsedMessage, Recipient
 
 _WHITESPACE = re.compile(r"\s+")
+_CONVERSATION_INDEX_MIN_BYTES = 22  # the header block of an Outlook conversation index: time and thread GUID
 # fmt: off
 _BLOCK_TAGS = frozenset([
     "address", "blockquote", "br", "dd", "div", "dt", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -95,6 +98,19 @@ def _text_of(part: EmailMessage) -> str:
         return part.get_content()
     except LookupError:  # a charset Python does not know: keep the text rather than lose the message
         return (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+
+
+def _conversation_index(msg: EmailMessage) -> bytes | None:
+    """The ``Thread-Index`` header (Outlook's conversation index, base64) as bytes; None when it is absent, not
+    base64, or shorter than the 22-byte header that carries the thread GUID."""
+    raw = _raw_header(msg, "Thread-Index")
+    if raw is None:
+        return None
+    try:
+        value = base64.b64decode(_WHITESPACE.sub("", raw), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return value if len(value) >= _CONVERSATION_INDEX_MIN_BYTES else None
 
 
 def _sent_ts(msg: EmailMessage) -> int | None:
@@ -202,7 +218,7 @@ def _convert(msg: EmailMessage, mtime: int) -> ParsedMessage:
         body_html=body_html,
         in_reply_to=next(iter(_ids(msg, "In-Reply-To")), None),
         references=_ids(msg, "References"),
-        conversation_index=None,
+        conversation_index=_conversation_index(msg),
         conversation_topic=None,
         attachments=_attachments(msg, mtime, (plain, html_part)),
     )

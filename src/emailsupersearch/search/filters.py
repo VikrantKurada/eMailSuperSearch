@@ -2,7 +2,9 @@
 
 ``candidate_message_keys`` answers "which messages may a search return" and ``chunk_rowids_for`` maps that answer to
 chunk rowids for ``keyword_search`` and the vector search. A message whose files are all tombstoned (deleted on disk,
-not yet purged) never qualifies. Every list is bound as ONE JSON array parameter and unpacked with ``json_each``;
+not yet purged) never qualifies: a candidate list holds live messages only, and without a filter (no list at all)
+the search drops such messages when it builds its cards. Every list is bound as ONE JSON array parameter and unpacked
+with ``json_each``;
 the SQL text only ever holds the fixed fragments below, so no value is interpolated. Everything runs on a plain
 connection, so callers pass ``ProjectStore.read_conn()``.
 
@@ -34,15 +36,17 @@ def _where(f: SearchFilters) -> tuple[str, list]:
     """
     clauses = [LIVE_MESSAGE_SQL]
     params: list = []
+    # The address predicates are written as exactly ``lower(sender_addr)`` and ``lower(addr)`` so the expression
+    # indexes serve them; the bound addresses are already stripped and lower-cased (the parsers store them stripped).
     senders = _addresses(f.from_addrs)
     if senders:
-        clauses.append("lower(trim(m.sender_addr)) IN (SELECT lower(value) FROM json_each(?))")
+        clauses.append("lower(m.sender_addr) IN (SELECT value FROM json_each(?))")
         params.append(json.dumps(senders))
     recipients = _addresses(f.recipient_addrs)
     if recipients:
         clauses.append(
-            "EXISTS (SELECT 1 FROM recipients r WHERE r.message_key = m.message_key AND r.kind IN ('to','cc')"
-            " AND lower(trim(r.addr)) IN (SELECT lower(value) FROM json_each(?)))"
+            "m.message_key IN (SELECT r.message_key FROM recipients r"
+            " WHERE lower(r.addr) IN (SELECT value FROM json_each(?)) AND r.kind IN ('to','cc'))"
         )
         params.append(json.dumps(recipients))
     if f.date_from is not None:
@@ -62,19 +66,17 @@ def _where(f: SearchFilters) -> tuple[str, list]:
     return " AND ".join(clauses), params
 
 
-def _has_tombstones(conn: sqlite3.Connection) -> bool:
-    return conn.execute("SELECT 1 FROM files WHERE tombstoned_at IS NOT NULL LIMIT 1").fetchone() is not None
-
-
 def candidate_message_keys(conn: sqlite3.Connection, f: SearchFilters) -> list[str] | None:
     """Keys of the live messages that pass every set filter, newest first; ``None`` means "no restriction".
 
-    ``None`` is returned only when no filter is set and the project has no tombstoned file rows, so every
-    message qualifies. With a tombstone present the list is always built, so a deleted message cannot surface.
-    ``query``, ``group_by_chain``, ``sort`` and ``only_with_conclusion`` are not candidate filters.
+    ``None`` is returned whenever no filter is set, tombstoned files or not: building a list of every message
+    (100k keys at the owner's scale) would cost more than the search itself. Liveness is enforced where the results
+    are built instead: ``build_message_cards`` keeps only messages with a live file, and ``messages_by_date`` and the
+    counts carry ``LIVE_MESSAGE_SQL``. ``query``, ``group_by_chain``, ``sort`` and ``only_with_conclusion`` are not
+    candidate filters.
     """
     where, params = _where(f)
-    if where == LIVE_MESSAGE_SQL and not _has_tombstones(conn):
+    if where == LIVE_MESSAGE_SQL:
         return None
     return [row[0] for row in conn.execute(_SELECT_KEYS + where + _NEWEST_FIRST, params)]
 
@@ -95,9 +97,10 @@ def chunk_rowids_for(conn: sqlite3.Connection, message_keys: list[str] | None) -
 def messages_by_date(conn: sqlite3.Connection, f: SearchFilters, limit: int, offset: int) -> list[str]:
     """One page of live message keys passing the filters, newest first, for searches with an empty query.
 
-    Messages without a ``sent_ts`` come last. ``limit < 1`` returns ``[]``.
+    Messages without a ``sent_ts`` come last. ``limit < 1``, or an offset beyond SQLite's integer range (a page
+    number no archive reaches), returns ``[]``.
     """
-    if limit < 1:
+    if limit < 1 or offset >= 2**63:
         return []
     where, params = _where(f)
     sql = _SELECT_KEYS + where + _NEWEST_FIRST + " LIMIT ? OFFSET ?"

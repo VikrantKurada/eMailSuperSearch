@@ -41,6 +41,8 @@ export function ResultsTab({ state, dispatch, api }: Props) {
 
   // The results may still be those of the previous filters while a search runs: go by what they hold.
   const grouped = results !== null && results.messages.length === 0;
+  // A query's totals count its top matches; filters alone count every matching email.
+  const matchLabel = filters.query.trim() === "" ? "emails match" : "top matches";
   const total = results === null ? 0 : grouped ? results.total_chains : results.total_messages;
   const pages = results === null ? 0 : Math.max(1, Math.ceil(total / results.page_size));
 
@@ -52,7 +54,7 @@ export function ResultsTab({ state, dispatch, api }: Props) {
             ? state.busy
               ? "Searching…"
               : ""
-            : `${results.total_chains} chains · ${results.total_messages} emails match`}
+            : `${results.total_chains} chains · ${results.total_messages} ${matchLabel}`}
         </span>
         <div class="results-tools">
           <div class="segmented" role="group" aria-label="Sort by">
@@ -95,7 +97,7 @@ export function ResultsTab({ state, dispatch, api }: Props) {
       {exported && (
         <p class="export-note muted">
           Exported {exported.rows} {exported.rows === 1 ? "row" : "rows"} to {exported.name}.
-          {exported.truncated && " The export was truncated at the row limit."}
+          {exported.truncated && " More emails match than the export holds (the row limit or the top-matches cap)."}
         </p>
       )}
 

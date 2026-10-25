@@ -1,6 +1,6 @@
 """The search route, and ``parse_filters``, which turns a JSON object into ``SearchFilters`` for it and the export.
 
-``POST /api/projects/{id}/search`` takes the ``SearchFilters`` fields, each optional, plus ``page`` (from 0) and
+``POST /api/projects/{id}/search`` takes the ``SearchFilters`` fields, each optional, plus ``page`` (0 to 2**63 - 1) and
 ``page_size`` (1 to 100), and answers one ``SearchResponse`` page as JSON. Unknown keys are ignored; a known key with
 a value of the wrong type is a 400. Searches read on the store's per-thread read connection (``search`` does).
 """
@@ -24,6 +24,7 @@ from emailsupersearch.search.hybrid import PAGE_SIZE, search
 from emailsupersearch.types import SearchFilters
 
 MAX_PAGE_SIZE = 100
+INT_LIMIT = 2**63  # page numbers and dates must lie in [0, INT_LIMIT): SQLite integers are 64-bit
 
 _LIST_FIELDS = ("from_addrs", "recipient_addrs", "attachment_kinds")
 _DATE_FIELDS = ("date_from", "date_to")
@@ -54,7 +55,7 @@ def parse_filters(body: dict[str, Any]) -> SearchFilters:
     """The ``SearchFilters`` in ``body``: absent fields take their defaults, other keys are ignored.
 
     ``ApiError(400)`` when a field has the wrong type: ``query`` a string; the address and kind lists lists of
-    strings; the dates integers or null; ``has_attachments`` a boolean or null; ``group_by_chain`` and
+    strings; the dates integers in [0, 2**63) or null; ``has_attachments`` a boolean or null; ``group_by_chain`` and
     ``only_with_conclusion`` booleans; ``sort`` ``"relevance"`` or ``"date"``.
     """
     values: dict[str, Any] = {}
@@ -67,8 +68,8 @@ def parse_filters(body: dict[str, Any]) -> SearchFilters:
             values[key] = list(str_list(body, key))
     for key in _DATE_FIELDS:
         if key in body:
-            if body[key] is not None and not _is_int(body[key]):
-                raise ApiError(400, f"{key} must be an integer or null")
+            if body[key] is not None and not (_is_int(body[key]) and 0 <= body[key] < INT_LIMIT):
+                raise ApiError(400, f"{key} must be an integer from 0 to 2**63 - 1, or null")
             values[key] = body[key]
     if "has_attachments" in body:
         if body["has_attachments"] is not None and not isinstance(body["has_attachments"], bool):
@@ -99,7 +100,7 @@ def search_route(request: Request) -> JSONResponse:
     sup = supervisor_or_409(services, request.path_params["project_id"])
     body = json_object(read_json(request))
     filters = parse_filters(body)
-    page = _page_int(body, "page", 0, 0, None)
+    page = _page_int(body, "page", 0, 0, INT_LIMIT - 1)
     page_size = _page_int(body, "page_size", PAGE_SIZE, 1, MAX_PAGE_SIZE)
     return JSONResponse(asdict(search(sup.store, services.embedder, filters, page, page_size)))
 

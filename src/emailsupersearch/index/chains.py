@@ -8,7 +8,8 @@ the chain named by, in this order:
 2. the ``In-Reply-To`` / ``References`` headers: the chain of the nearest ancestor already stored;
 3. the same normalised subject sent within 30 days of a stored message that shares an address with it,
    which catches replies that lost their headers;
-4. otherwise a new chain, ``c-<first 16 characters of the message key>``.
+4. otherwise a new chain, ``fallback_chain_id``: ``c-`` and the first 16 hex digits of the key's SHA-256 (Exchange
+   Message-IDs share long prefixes, so the key's own first characters would put unrelated messages in one chain).
 
 Reads run on the writer connection under ``store.lock``, as plain SELECTs with no transaction of their own;
 ``update_chain_row`` writes under ``store.lock`` inside one transaction. ``recompute_chain_row`` is the same write for
@@ -17,6 +18,7 @@ a caller that already holds the lock and has a transaction open (the store's ``w
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable
@@ -50,6 +52,11 @@ def chain_depth(conversation_index: bytes | None) -> int:
     return (len(conversation_index) - _HEADER_LEN) // _REPLY_LEN
 
 
+def fallback_chain_id(message_key: str) -> str:
+    """The id of a new chain started by ``message_key``: ``c-`` and the first 16 hex digits of its SHA-256."""
+    return "c-" + hashlib.sha256(message_key.encode("utf-8")).hexdigest()[:16]
+
+
 def assign_chain(store: ProjectStore, m: ParsedMessage, message_key: str) -> tuple[str, int]:
     """The chain id and depth for ``m``, which is about to be stored under ``message_key``.
 
@@ -63,7 +70,7 @@ def assign_chain(store: ProjectStore, m: ParsedMessage, message_key: str) -> tup
         found = _by_headers(store.conn, m, message_key) or _by_subject(store.conn, m, message_key)
     if found is not None:
         return found
-    return "c-" + message_key[:16], 0
+    return fallback_chain_id(message_key), 0
 
 
 def _by_headers(conn: sqlite3.Connection, m: ParsedMessage, message_key: str) -> tuple[str, int] | None:

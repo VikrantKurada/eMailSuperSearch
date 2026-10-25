@@ -1,3 +1,4 @@
+import base64
 import email
 import email.policy
 import os
@@ -306,3 +307,14 @@ def test_conversation_fields_are_none(tmp_path):
     m.set_content("hi")
     parsed = parse_eml(write(tmp_path, m))
     assert parsed.conversation_index is None and parsed.conversation_topic is None
+
+
+def test_thread_index_header_becomes_the_conversation_index(tmp_path):
+    index = bytes(range(22)) + bytes(5)  # the 22-byte header (time and thread GUID) plus one reply block
+    m = base_message(Thread_Index=base64.b64encode(index).decode("ascii"))
+    m.set_content("hi")
+    assert parse_eml(write(tmp_path, m)).conversation_index == index
+    for bad in ("not base64!", base64.b64encode(bytes(21)).decode("ascii")):  # undecodable, or shorter than the header
+        m = base_message(Thread_Index=bad)
+        m.set_content("hi")
+        assert parse_eml(write(tmp_path, m, "bad.eml")).conversation_index is None

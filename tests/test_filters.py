@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from emailsupersearch.ingest.chunker import ChunkText
+from emailsupersearch.search import filters
 from emailsupersearch.search.filters import (
     candidate_message_keys,
     chunk_rowids_for,
@@ -156,8 +157,10 @@ def test_empty_address_strings_are_ignored(seeded):
 def test_tombstoned_messages_excluded(seeded):
     seeded.store.tombstone(["/mail/m3.eml"], now=1)
 
-    keys = candidate_message_keys(seeded.conn, SearchFilters())
-    assert keys == ["m4", "m2", "m1"]  # a list now, not None: the tombstoned message must not surface
+    # No filter means no candidate list even with a tombstone: building one would list every message. The search
+    # drops the tombstoned message when it builds its cards (test_hybrid covers that).
+    assert candidate_message_keys(seeded.conn, SearchFilters()) is None
+    assert candidate_message_keys(seeded.conn, SearchFilters(date_from=0)) == ["m4", "m2", "m1"]
     assert candidate_message_keys(seeded.conn, SearchFilters(from_addrs=["carol@example.org"])) == []
     assert candidate_message_keys(seeded.conn, SearchFilters(recipient_addrs=["dave@example.org"])) == []
     assert messages_by_date(seeded.conn, SearchFilters(), 10, 0) == ["m4", "m2", "m1"]
@@ -171,7 +174,7 @@ def test_message_with_a_live_and_a_tombstoned_file_stays_visible(seeded):
         )
     )
     seeded.store.tombstone(["/mail/m3.eml"], now=1)
-    assert candidate_message_keys(seeded.conn, SearchFilters()) == ["m4", "m3", "m2", "m1"]
+    assert candidate_message_keys(seeded.conn, SearchFilters(date_from=0)) == ["m4", "m3", "m2", "m1"]
 
 
 def test_chunk_rowids_for_subset(seeded):
@@ -204,3 +207,13 @@ def test_count_messages_and_chains(seeded):
     assert count_chains(seeded.conn, SearchFilters(from_addrs=["bob@example.org", "carol@example.org"])) == 2
     seeded.store.tombstone(["/mail/m3.eml"], now=1)
     assert count_messages(seeded.conn, everything) == 3 and count_chains(seeded.conn, everything) == 2
+
+
+def test_address_filters_use_the_lower_case_indexes(seeded):
+    for f, index in (
+        (SearchFilters(from_addrs=["alice@example.com"]), "idx_messages_sender_lower"),
+        (SearchFilters(recipient_addrs=["bob@example.org"]), "idx_recipients_addr_lower"),
+    ):
+        where, params = filters._where(f)
+        plan = seeded.conn.execute("EXPLAIN QUERY PLAN SELECT m.message_key FROM messages m WHERE " + where, params)
+        assert index in " ".join(str(row[3]) for row in plan), f

@@ -60,6 +60,13 @@ describe("ResultsTab", () => {
     expect(dispatch).toHaveBeenCalledWith({ type: "setFilters", filters: { ...initialState.filters, sort: "date" } });
   });
 
+  it("a query's totals read as top matches", () => {
+    const queried: State = { ...state, filters: { ...initialState.filters, query: "renewal" } };
+    render(<ResultsTab state={queried} dispatch={vi.fn()} api={new Api()} />);
+
+    expect(screen.getByText("1 chains · 1 top matches")).toBeTruthy();
+  });
+
   it("ticking a chain card's checkbox dispatches togglePinChain", () => {
     const dispatch = vi.fn();
     render(<ResultsTab state={state} dispatch={dispatch} api={new Api()} />);
