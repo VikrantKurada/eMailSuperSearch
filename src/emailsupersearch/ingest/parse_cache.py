@@ -127,13 +127,17 @@ class ParseCache:
         """Record the OCR result for one attachment: the OCR text appended to its text (``append_ocr_text``),
         status ``ok`` and no pages left to read.
 
-        Raises ``KeyError`` when there is no entry for ``sha256`` or it has no such attachment.
+        Does nothing when the attachment's status is already ``ok``: its OCR text is in (a job run twice, say after a
+        crash between the write and the job's completion), or it never needed OCR. Raises ``KeyError`` when there is
+        no entry for ``sha256`` or it has no such attachment.
         """
         doc = self.get(sha256)
         if doc is None:
             raise KeyError(sha256)
         for attachment in doc.attachments:
             if attachment.ordinal == ordinal:
+                if attachment.status == "ok":
+                    return
                 attachment.text = append_ocr_text(attachment.text, text)
                 attachment.status, attachment.needs_ocr_pages = "ok", []
                 break

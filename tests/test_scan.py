@@ -193,10 +193,12 @@ def test_reappearing_file_is_revived_not_reparsed(tmp_store, corpus_dir, tmp_pat
     assert (row.tombstoned_at, row.last_seen_scan_id, row.parse_status) == (None, 3, "indexed")
 
 
-def test_a_deletion_found_after_an_aborted_scan_is_not_purged_in_the_same_scan(tmp_store, corpus_dir):
+def test_a_deletion_found_after_an_aborted_scan_is_not_purged_in_the_same_scan(tmp_store, corpus_dir, monkeypatch):
     victim = _emls(corpus_dir)[0]
     reconcile(tmp_store, [corpus_dir], 1, 1)
-    reconcile(tmp_store, [corpus_dir / "gone"], 2, 2)  # the root was unreachable, so scan 2 stamped nothing
+    with monkeypatch.context() as m:
+        _deny_scandir(m, corpus_dir)
+        reconcile(tmp_store, [corpus_dir], 2, 2)  # the root was unreachable, so scan 2 stamped nothing
     victim.unlink()
     r3 = reconcile(tmp_store, [corpus_dir], 3, 3)
     assert r3.tombstoned == [str(victim)] and r3.purged == []
@@ -206,10 +208,15 @@ def test_a_deletion_found_after_an_aborted_scan_is_not_purged_in_the_same_scan(t
 
 def test_missing_root_aborts_without_tombstones(tmp_store, corpus_dir):
     reconcile(tmp_store, [corpus_dir], 1, 1)
-    r = reconcile(tmp_store, [corpus_dir / "gone"], 2, 2)
+    parked = corpus_dir.with_name("parked")
+    corpus_dir.rename(parked)  # the watched folder is gone, say a disconnected drive
+    try:
+        r = reconcile(tmp_store, [corpus_dir], 2, 2)
+    finally:
+        parked.rename(corpus_dir)
     assert r.aborted_roots and r.tombstoned == [] and tmp_store.counts()["tombstoned"] == 0
-    assert r.aborted_roots == [str(corpus_dir / "gone")] and r.to_parse == [] and r.purged == []
-    assert [path for path, _ in r.errors] == [str(corpus_dir / "gone")] and r.errors[0][1].startswith("FileNotFoundError: ")
+    assert r.aborted_roots == [str(corpus_dir)] and r.to_parse == [] and r.purged == []
+    assert [path for path, _ in r.errors] == [str(corpus_dir)] and r.errors[0][1].startswith("FileNotFoundError: ")
 
 
 def test_root_that_is_a_file_aborts(tmp_store, corpus_dir):
@@ -221,16 +228,18 @@ def test_root_that_is_a_file_aborts(tmp_store, corpus_dir):
     assert tmp_store.counts()["tombstoned"] == 0 and r.unchanged + len(r.to_parse) == len(_emls(corpus_dir))
 
 
-def test_one_aborted_root_leaves_the_other_roots_deletions_in_force(tmp_store, corpus_dir, tmp_path):
+def test_one_aborted_root_leaves_the_other_roots_deletions_in_force(tmp_store, corpus_dir, tmp_path, monkeypatch):
     second = tmp_path / "second"
     second.mkdir()
     shutil.copy(_emls(corpus_dir)[0], second / "kept.eml")
     shutil.copy(_emls(corpus_dir)[1], second / "gone.eml")
     reconcile(tmp_store, [corpus_dir, second], 1, 1)
     (second / "gone.eml").unlink()
-    r = reconcile(tmp_store, [corpus_dir / "missing", second], 2, 2)
-    assert r.aborted_roots == [str(corpus_dir / "missing")] and r.tombstoned == [str(second / "gone.eml")]
-    assert tmp_store.get_file(str(_emls(corpus_dir)[0])).tombstoned_at is None
+    first = _emls(corpus_dir)[0]
+    _deny_scandir(monkeypatch, corpus_dir)
+    r = reconcile(tmp_store, [corpus_dir, second], 2, 2)
+    assert r.aborted_roots == [str(corpus_dir)] and r.tombstoned == [str(second / "gone.eml")]
+    assert tmp_store.get_file(str(first)).tombstoned_at is None
 
 
 def test_non_mail_files_ignored(tmp_store, corpus_dir):
@@ -277,13 +286,39 @@ def test_pending_row_is_parsed_even_when_only_its_mtime_changed(tmp_store, corpu
     assert reconcile(tmp_store, [corpus_dir], 2, 2).to_parse == [target]
 
 
-def test_aborted_root_keeps_old_tombstones(tmp_store, corpus_dir):
+def test_aborted_root_keeps_old_tombstones(tmp_store, corpus_dir, monkeypatch):
     reconcile(tmp_store, [corpus_dir], 1, 1)
     victim = _emls(corpus_dir)[0]
     victim.unlink()
     reconcile(tmp_store, [corpus_dir], 2, 2)
-    r = reconcile(tmp_store, [corpus_dir / "gone"], 3, 3)
+    _deny_scandir(monkeypatch, corpus_dir)
+    r = reconcile(tmp_store, [corpus_dir], 3, 3)
     assert r.purged == [] and tmp_store.counts()["tombstoned"] == 1
+
+
+def test_rows_of_a_folder_no_longer_watched_are_tombstoned_then_purged(tmp_store, corpus_dir, tmp_path):
+    second = tmp_path / "second"
+    second.mkdir()
+    shutil.copy(_emls(corpus_dir)[0], second / "a.eml")
+    shutil.copy(_emls(corpus_dir)[1], second / "b.eml")
+    reconcile(tmp_store, [corpus_dir, second], 1, 1)
+    files = tmp_store.counts()["files"]
+    r2 = reconcile(tmp_store, [corpus_dir], 2, 2)  # the folder was removed from the project; its files remain
+    assert r2.tombstoned == [str(second / "a.eml"), str(second / "b.eml")] and r2.purged == []
+    assert tmp_store.counts()["files"] == files - 2
+    r3 = reconcile(tmp_store, [corpus_dir], 3, 3)
+    assert [rec.path for rec in r3.purged] == [str(second / "a.eml"), str(second / "b.eml")] and r3.tombstoned == []
+    assert tmp_store.get_file(str(second / "a.eml")) is None and tmp_store.counts()["tombstoned"] == 0
+    assert tmp_store.get_file(str(_emls(corpus_dir)[0])).tombstoned_at is None
+
+
+def test_a_root_that_merely_shares_a_prefix_is_not_inside_another(tmp_store, corpus_dir, tmp_path):
+    sibling = corpus_dir.with_name(corpus_dir.name + "-old")
+    sibling.mkdir()
+    shutil.copy(_emls(corpus_dir)[0], sibling / "a.eml")
+    reconcile(tmp_store, [corpus_dir, sibling], 1, 1)
+    r = reconcile(tmp_store, [corpus_dir], 2, 2)
+    assert r.tombstoned == [str(sibling / "a.eml")]
 
 
 def _deny_scandir(monkeypatch, directory):

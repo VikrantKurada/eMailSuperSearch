@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 # SQLite caps the number of bound parameters per statement, so long ``IN (...)`` lists go in batches.
 _BATCH = 500
 
+# The reason recorded on the file row of a duplicate export: ``indexed``, but the message was indexed from another path.
+DUPLICATE_REASON = "duplicate"
+
 
 @dataclass
 class FileRecord:
@@ -343,6 +346,31 @@ class ProjectStore:
                 self.conn.execute(f"DELETE FROM files WHERE path IN ({_marks(len(batch))})", tuple(batch))
         return purged
 
+    def rows_outside(self, roots: Sequence[str]) -> list[FileRecord]:
+        """Live rows whose path lies below none of ``roots`` (every live row when ``roots`` is empty): files of a
+        folder the project no longer watches."""
+        return self._outside(roots, "tombstoned_at IS NULL", ())
+
+    def purge_tombstoned_outside(self, roots: Sequence[str], scan_id: int) -> list[FileRecord]:
+        """Delete and return tombstoned rows below none of ``roots`` that have been unseen for two scans: the rows of a
+        removed folder, tombstoned by an earlier scan (the rule of ``purge_tombstoned_under``)."""
+        with self._lock, self.conn:
+            purged = self._outside(roots, "tombstoned_at IS NOT NULL AND last_seen_scan_id < ?", (scan_id - 1,))
+            for batch in _batches([r.path for r in purged]):
+                self.conn.execute(f"DELETE FROM files WHERE path IN ({_marks(len(batch))})", tuple(batch))
+        return purged
+
+    def _outside(self, roots: Sequence[str], condition: str, params: tuple[Any, ...]) -> list[FileRecord]:
+        sql = f"SELECT * FROM files WHERE {condition}"
+        args: list[Any] = list(params)
+        if roots:
+            under, under_params = _under_roots(roots)
+            sql += f" AND NOT {under}"
+            args += under_params
+        with self._lock:
+            rows = self.conn.execute(sql + " ORDER BY path", args).fetchall()
+        return [_file(r) for r in rows]
+
     def set_file_parse_result(
         self, path: str, message_key: str | None, parse_status: str, status_reason: str
     ) -> None:
@@ -370,6 +398,19 @@ class ProjectStore:
                 (sha256,),
             )
             return [r["message_key"] for r in rows]
+
+    def live_indexed_paths_for_message(self, message_key: str) -> list[str]:
+        """Live paths whose own parse indexed the message, sorted: ``indexed`` or ``indexed_partial``, and not marked
+        as a duplicate export (``DUPLICATE_REASON``, possibly followed by ``; <note>``). A ``pending`` path, such as
+        every path after ``clear_index``, does not count."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT path FROM files WHERE message_key = ? AND tombstoned_at IS NULL"
+                " AND parse_status IN ('indexed', 'indexed_partial')"
+                " AND status_reason != ? AND substr(status_reason, 1, ?) != ? ORDER BY path",
+                (message_key, DUPLICATE_REASON, len(DUPLICATE_REASON) + 1, DUPLICATE_REASON + ";"),
+            )
+            return [r["path"] for r in rows]
 
     def paths_for_message(self, message_key: str, live_only: bool = True) -> list[str]:
         sql = "SELECT path FROM files WHERE message_key = ?"

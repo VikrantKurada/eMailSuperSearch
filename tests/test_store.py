@@ -641,3 +641,30 @@ def test_pending_file_count_counts_live_pending_rows(tmp_store, corpus_dir):
         tmp_store.upsert_file(_rec(os.path.join(root, name), parse_status=status))
     tmp_store.tombstone([os.path.join(root, "gone.eml")], 10)
     assert tmp_store.pending_file_count() == 2
+
+
+def test_live_indexed_paths_for_message_counts_only_paths_that_indexed_it(tmp_store, corpus_dir):
+    a, b, c, d, e, f = (os.path.join(str(corpus_dir), f"{n}.eml") for n in "abcdef")
+    tmp_store.upsert_file(_rec(a, message_key="m1"))
+    tmp_store.upsert_file(_rec(b, message_key="m1", parse_status="indexed_partial", status_reason="1 attachments not indexed"))
+    tmp_store.upsert_file(_rec(c, message_key="m1", status_reason="duplicate"))
+    tmp_store.upsert_file(_rec(d, message_key="m1", status_reason="duplicate; chunk text truncated"))
+    tmp_store.upsert_file(_rec(e, message_key="m1", parse_status="pending"))
+    tmp_store.upsert_file(_rec(f, message_key="m1", tombstoned_at=5))
+    assert tmp_store.live_indexed_paths_for_message("m1") == [a, b]
+    tmp_store.clear_index()
+    assert tmp_store.live_indexed_paths_for_message("m1") == []  # every live path is pending again
+
+
+def test_rows_outside_and_their_purge(tmp_store, tmp_path):
+    kept, sibling, gone = (str(tmp_path / name / "a.eml") for name in ("mail", "mail-old", "removed"))
+    for path in (kept, sibling, gone):
+        tmp_store.upsert_file(_rec(path, last_seen_scan_id=1))
+    roots = [str(tmp_path / "mail")]
+    assert [r.path for r in tmp_store.rows_outside(roots)] == [sibling, gone]  # "mail-old" is not below "mail"
+    assert [r.path for r in tmp_store.rows_outside([])] == sorted([kept, sibling, gone])
+    tmp_store.tombstone([gone], 2)
+    assert [r.path for r in tmp_store.rows_outside(roots)] == [sibling]  # live rows only
+    assert tmp_store.purge_tombstoned_outside(roots, 2) == []  # seen in scan 1: not two scans unseen yet
+    assert [r.path for r in tmp_store.purge_tombstoned_outside(roots, 3)] == [gone]
+    assert tmp_store.get_file(gone) is None and tmp_store.get_file(sibling) is not None

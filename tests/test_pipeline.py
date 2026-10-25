@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 from email.message import EmailMessage
 
@@ -534,3 +535,72 @@ def test_chain_steps_run_without_the_store_lock_held(pipeline, corpus_dir, monke
     assert outcome.status == "indexed"
     assert held == [("assign_chain", False), ("write_indexed_message", False)]  # the store takes its own lock
     assert pipeline.store.conn.execute("SELECT message_count FROM chains").fetchone()[0] == 1
+
+
+def _dup_pair(corpus_dir):
+    """A corpus message and a second export of it (``dup.eml``, one extra header); the walk reaches ``dup.eml`` first."""
+    src = min(corpus_dir.glob("*.eml"))
+    dup = corpus_dir / "dup.eml"
+    dup.write_bytes(b"X-Export: 2\r\n" + src.read_bytes())
+    return src, dup
+
+
+def test_reindex_with_duplicate_export_rechunks(pipeline, corpus_dir):
+    src, dup = _dup_pair(corpus_dir)
+    pipeline.apply_scan(_scan(pipeline, corpus_dir, 1))
+    key = pipeline.store.get_file(str(src)).message_key
+    before = len(pipeline.store.chunk_rowids(key))
+    assert before > 0
+    pipeline.store.clear_index()  # what the supervisor does when the embedder or the chunker changed
+    outcomes = {o.path: o for o in pipeline.apply_scan(_scan(pipeline, corpus_dir, 2)) if o.message_key == key}
+    assert len(pipeline.store.chunk_rowids(key)) == before
+    assert sorted(o.status for o in outcomes.values()) == ["indexed", "skipped_duplicate"]
+    rows = [pipeline.store.get_file(path) for path in (str(src), str(dup))]
+    assert sorted((r.parse_status, r.status_reason) for r in rows) == [("indexed", ""), ("indexed", "duplicate")]
+    assert pipeline.store.counts()["metadata_only"] == 0
+
+
+def test_changed_source_file_is_reindexed_while_a_duplicate_exists(pipeline, tmp_path):
+    folder = tmp_path / "pair"
+    first = _eml(folder, "a.eml", "The first draft mentions the walrus.", message_id="<pair@example.com>")
+    _eml(folder, "b.eml", "The first draft mentions the walrus.", message_id="<pair@example.com>")
+    outcomes = pipeline.apply_scan(_scan(pipeline, folder, 1))
+    assert [o.status for o in outcomes] == ["indexed", "skipped_duplicate"]  # a.eml is reached first
+    _eml(folder, "a.eml", "The second draft mentions the quokka.", message_id="<pair@example.com>")
+    os.utime(first, ns=(first.stat().st_atime_ns, first.stat().st_mtime_ns + 10**9))
+    changed = pipeline.apply_scan(_scan(pipeline, folder, 2))
+    assert [(o.path, o.status) for o in changed] == [(str(first), "indexed")]
+    key = changed[0].message_key
+    hits = {h[0] for h in keyword_search(pipeline.store.conn, "quokka", 10, None)}
+    assert hits and hits <= set(pipeline.store.chunk_rowids(key))
+    assert not keyword_search(pipeline.store.conn, "walrus", 10, None)
+
+
+def test_attach_ocr_text_twice_adds_the_text_once(pipeline, corpus_dir):
+    p = _first_with(corpus_dir, "image")
+    _scan(pipeline, corpus_dir)
+    k = pipeline.ingest_file(p, 1).message_key
+    sha = pipeline.store.get_file(str(p)).sha256
+    pipeline.attach_ocr_text(sha, 0, "zebra crossing report")
+    chunks = [tuple(r) for r in pipeline.store.conn.execute("SELECT id, text FROM chunks WHERE message_key=?", (k,))]
+    pipeline.attach_ocr_text(sha, 0, "zebra crossing report")  # the same job again, say after a crash
+    assert pipeline.cache.get(sha).attachments[0].text == "zebra crossing report"
+    assert [tuple(r) for r in pipeline.store.conn.execute("SELECT id, text FROM chunks WHERE message_key=?", (k,))] == chunks
+
+
+def test_mark_ocr_unavailable_spares_an_attachment_already_read(pipeline_with_queue, corpus_dir):
+    pipeline = pipeline_with_queue
+    p = _first_with(corpus_dir, "image")
+    _scan(pipeline, corpus_dir)
+    k = pipeline.ingest_file(p, 1).message_key
+    sha = pipeline.store.get_file(str(p)).sha256
+
+    def ocr_status():
+        return pipeline.store.conn.execute("SELECT ocr_status FROM attachments WHERE message_key=?", (k,)).fetchone()[0]
+
+    assert ocr_status() == "pending"
+    pipeline.mark_ocr_unavailable(sha, 0)
+    assert ocr_status() == "unavailable"
+    pipeline.attach_ocr_text(sha, 0, "zebra crossing report")
+    pipeline.mark_ocr_unavailable(sha, 0)  # a stale failure of the same attachment
+    assert ocr_status() == "ok"

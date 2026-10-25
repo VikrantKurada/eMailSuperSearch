@@ -15,9 +15,22 @@ def test_cache_set_ocr_text(tmp_path, eml_doc_with_image):
     c = ParseCache(tmp_path); c.put(eml_doc_with_image); c.set_ocr_text(eml_doc_with_image.sha256, 0, "recovered words")
     a = c.get(eml_doc_with_image.sha256).attachments[0]; assert (a.status, a.text, a.needs_ocr_pages) == ("ok", "recovered words", [])
 def test_cache_set_ocr_text_appends_to_existing_text(tmp_path, eml_doc):
-    c = ParseCache(tmp_path); c.put(eml_doc); layer = eml_doc.attachments[0].text; assert layer
+    att = eml_doc.attachments[0]; att.status, att.needs_ocr_pages = "needs_ocr", [1]  # a text layer plus a scanned page
+    c = ParseCache(tmp_path); c.put(eml_doc); layer = att.text; assert layer
     c.set_ocr_text(eml_doc.sha256, 0, "recovered words")
     a = c.get(eml_doc.sha256).attachments[0]; assert (a.status, a.text, a.needs_ocr_pages) == ("ok", layer + "\n\nrecovered words", [])
+
+
+def test_cache_set_ocr_text_is_a_no_op_once_the_attachment_is_ok(tmp_path, eml_doc_with_image, eml_doc):
+    c = ParseCache(tmp_path)
+    c.put(eml_doc_with_image)
+    c.set_ocr_text(eml_doc_with_image.sha256, 0, "recovered words")
+    c.set_ocr_text(eml_doc_with_image.sha256, 0, "recovered words")  # the same job run twice
+    assert c.get(eml_doc_with_image.sha256).attachments[0].text == "recovered words"
+    assert eml_doc.attachments[0].status == "ok"  # a text layer only: it never needed OCR
+    c.put(eml_doc)
+    c.set_ocr_text(eml_doc.sha256, 0, "stray words")
+    assert c.get(eml_doc.sha256) == eml_doc
 
 
 def test_cache_roundtrip_is_lossless(tmp_path, eml_doc):

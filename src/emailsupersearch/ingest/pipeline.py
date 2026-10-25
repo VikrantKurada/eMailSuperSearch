@@ -52,7 +52,7 @@ from emailsupersearch.ingest.parse import ParseError
 from emailsupersearch.ingest.parse_cache import ParseCache, append_ocr_text, sha256_file
 from emailsupersearch.ingest.workers import ParseMemoryExceeded, ParsePool, ParseTimeout
 from emailsupersearch.logging_setup import log_subject, redact
-from emailsupersearch.store import PartWrite
+from emailsupersearch.store import DUPLICATE_REASON, PartWrite
 from emailsupersearch.types import AttachmentText, ParsedDocument, ParsedMessage
 
 if TYPE_CHECKING:
@@ -74,6 +74,7 @@ _NOT_INDEXED = ("unsupported", "failed")  # attachment statuses that make the fi
 _EARLIER_IN_CHAIN = "SELECT 1 FROM messages WHERE chain_id = ? AND message_key != ? AND sent_ts < ? LIMIT 1"
 _OTHER_IN_CHAIN = "SELECT 1 FROM messages WHERE chain_id = ? AND message_key != ? LIMIT 1"
 _ATTACHMENT_FILENAME = "SELECT filename FROM attachments WHERE message_key = ? AND ordinal = ?"
+_ATTACHMENT_OCR_STATUS = "SELECT ocr_status FROM attachments WHERE message_key = ? AND ordinal = ?"
 
 IngestStatus = Literal["indexed", "indexed_partial", "failed", "skipped_duplicate"]
 
@@ -189,13 +190,38 @@ class IngestPipeline:
         every stored message a live file with those bytes links to, the part ``att:<ordinal>`` is re-chunked and
         re-embedded from the combined text and the attachment is marked ``ok``. Raises ``KeyError`` when the cache
         has no such entry or attachment.
+
+        A result that is already in is not added twice: a message whose attachment row is ``ocr_status = "ok"`` is
+        left as it is, and the cache entry of an attachment already ``ok`` keeps its text (``set_ocr_text`` does
+        nothing then), which is also the text any other message gets.
         """
         doc = self.cache.get(sha256)
-        existing = next((a.text for a in doc.attachments if a.ordinal == ordinal), "") if doc is not None else ""
+        cached = next((a for a in doc.attachments if a.ordinal == ordinal), None) if doc is not None else None
         self.cache.set_ocr_text(sha256, ordinal, text)
-        combined = append_ocr_text(existing, text)
+        if cached is not None and cached.status == "ok":
+            combined = cached.text  # the OCR text is in already
+        else:
+            combined = append_ocr_text(cached.text if cached is not None else "", text)
         for key in self.store.message_keys_for_sha256(sha256):
-            self._attach_ocr_part(key, ordinal, combined)
+            if self._ocr_status(key, ordinal) != "ok":
+                self._attach_ocr_part(key, ordinal, combined)
+
+    def mark_ocr_unavailable(self, sha256: str, ordinal: int) -> None:
+        """The OCR job for attachment ``ordinal`` of the file whose bytes hash to ``sha256`` failed for good: the
+        attachment of every stored message a live file with those bytes links to is marked
+        ``ocr_status = "unavailable"``, unless its OCR already succeeded. Never raises."""
+        try:
+            for key in self.store.message_keys_for_sha256(sha256):
+                if self._ocr_status(key, ordinal) != "ok":
+                    self.store.set_attachment_status(key, ordinal, ocr_status="unavailable")
+        except Exception as e:
+            log.warning("could not mark an attachment's OCR unavailable: %s", type(e).__name__)
+            log.debug("marking attachment %d of %s failed", ordinal, sha256, exc_info=True)
+
+    def _ocr_status(self, key: str, ordinal: int) -> str | None:
+        with self.store.lock:
+            row = self.store.conn.execute(_ATTACHMENT_OCR_STATUS, (key, ordinal)).fetchone()
+        return None if row is None else row[0]
 
     # ---- stages ----
 
@@ -207,9 +233,9 @@ class IngestPipeline:
             doc = self._parse(path)
             key = message_key(doc.message)
             if self._is_duplicate(where, key):
-                self._record(where, key, "indexed", "duplicate")
+                self._record(where, key, "indexed", DUPLICATE_REASON)
                 log.info("duplicate export of a stored message: %s", log_subject(doc.message.subject))
-                return IngestOutcome(where, key, "skipped_duplicate", "duplicate")
+                return IngestOutcome(where, key, "skipped_duplicate", DUPLICATE_REASON)
             return self._index(path, doc, key)
         except ParseTimeout as e:
             reason, kind = _timeout_reason(e), "timeout"
@@ -241,8 +267,13 @@ class IngestPipeline:
         return doc
 
     def _is_duplicate(self, where: str, key: str) -> bool:
-        """Whether the message is already stored and another live path holds it (an export of the same email)."""
-        others = [p for p in self.store.paths_for_message(key) if p != where]
+        """Whether the message is already stored and another live path indexed it (an export of the same email).
+
+        Only a path whose own parse indexed the message counts (``live_indexed_paths_for_message``): after
+        ``clear_index`` every path is ``pending``, so the first one parsed indexes the message again and the others
+        are its duplicates; and a changed source file is re-indexed even while a duplicate export of it exists.
+        """
+        others = [p for p in self.store.live_indexed_paths_for_message(key) if p != where]
         return bool(others) and self.store.message(key) is not None
 
     def _index(self, path: Path, doc: ParsedDocument, key: str) -> IngestOutcome:

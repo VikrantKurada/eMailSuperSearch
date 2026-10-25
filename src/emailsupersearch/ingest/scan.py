@@ -5,7 +5,8 @@ its manifest row. It hashes only new and changed files, recognises a renamed fil
 re-parse), stamps every file it saw, and tombstones the rows it did not see. A tombstone is purged only once the
 next scan confirms the file is still gone. A root that cannot be listed is left alone: nothing under it is
 tombstoned or purged. So is a subdirectory that cannot be listed, and so is a file that cannot be read: an error
-below a root never costs rows. Symlinks and NTFS junctions are not followed (a junction can duplicate a folder or
+below a root never costs rows. Rows below none of the roots passed in (a folder the project no longer watches) are
+tombstoned, then purged by a later scan, like the rows of deleted files; callers therefore pass every configured root. Symlinks and NTFS junctions are not followed (a junction can duplicate a folder or
 loop back on itself). The scan owns the manifest's size, mtime, hash, file id and last-seen columns; it never writes
 back the columns the ingest pipeline owns. Parsing is the pipeline's job.
 """
@@ -96,8 +97,9 @@ class _Reconciler:
         self._unreadable: list[str] = []  # subtrees (or entries) that raised OSError; their rows are left as they are
 
     def run(self, roots: list[Path], now: int) -> ScanResult:
+        configured = [os.path.normpath(str(r)) for r in roots]
         live_roots: list[str] = []
-        for root in (os.path.normpath(str(r)) for r in roots):
+        for root in configured:
             try:
                 entries = _list_dir(root)
             except NotADirectoryError:
@@ -113,6 +115,7 @@ class _Reconciler:
         self._keep_unreadable_rows()
         self.store.stamp_seen(list(self._seen), self.scan_id)
         self._remove_missing(live_roots, now)
+        self._remove_outside(configured, now)
         return self.result
 
     def _abort(self, root: str, reason: str) -> None:
@@ -250,6 +253,15 @@ class _Reconciler:
         missing = sorted(rec.path for rec in self.store.unseen_under(live_roots, self.scan_id))
         self.store.tombstone(missing, now)
         self.result.tombstoned = missing
+
+    def _remove_outside(self, configured: list[str], now: int) -> None:
+        """Retire the rows of folders the project no longer watches. Rows below none of ``configured`` (every root
+        passed in, aborted ones included, so an unreachable root keeps its rows) are tombstoned, and a later scan
+        purges them under the same two-scan rule as a deleted file; purging first, as in ``_remove_missing``."""
+        self.result.purged += self.store.purge_tombstoned_outside(configured, self.scan_id)
+        outside = [rec.path for rec in self.store.rows_outside(configured)]
+        self.store.tombstone(outside, now)
+        self.result.tombstoned += outside
 
 
 def reconcile(store: ProjectStore, roots: list[Path], scan_id: int, now: int) -> ScanResult:

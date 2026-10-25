@@ -13,7 +13,7 @@ from emailsupersearch.cli import main
 from emailsupersearch.ingest.ocr.worker import OcrJobFailed
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.jobs import supervisor as supervisor_module
-from emailsupersearch.jobs.queue import enqueue, pending_counts
+from emailsupersearch.jobs.queue import claim_next, enqueue, pending_counts
 from emailsupersearch.jobs.supervisor import build_project_supervisor
 
 
@@ -318,3 +318,69 @@ def test_set_reconcile_interval_changes_next_timer(sup):
     assert sup.reconcile_interval_s == 120  # what _arm_timer reads
     sup._arm_timer()
     assert sup._timer.interval == 120  # stop() at teardown cancels it
+
+
+def test_a_removed_folder_leaves_the_index(sup, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    for n in (1, 2):
+        (other / f"m{n}.eml").write_bytes(make_eml_bytes(subject=f"other {n}", seed=200 + n))
+    sup.store.add_folder(str(other), "local")
+    sup.run_once()
+    keys = [sup.store.get_file(str(other / f"m{n}.eml")).message_key for n in (1, 2)]
+    assert all(sup.store.message(key) is not None for key in keys)
+    files = sup.store.counts()["files"]
+    sup.store.remove_folder(str(other))
+    sup.run_once()  # tombstones the folder's rows: their messages are out of every search already
+    assert sup.store.counts()["files"] == files - 2
+    sup.run_once()  # purges them, and the messages go
+    assert all(sup.store.message(key) is None and sup.store.chunk_rowids(key) == [] for key in keys)
+    assert sup.store.counts()["tombstoned"] == 0 and sup.store.counts()["files"] == files - 2
+
+
+def _ocr_target(sup):
+    """``(message_key, ordinal, sha256)`` of a stored attachment, its OCR status reset to ``pending``."""
+    with sup.store.lock:
+        key, ordinal, sha = sup.store.conn.execute(
+            "SELECT a.message_key, a.ordinal, f.sha256 FROM attachments a JOIN files f ON f.message_key = a.message_key"
+            " ORDER BY a.message_key, a.ordinal LIMIT 1"
+        ).fetchone()
+    sup.store.set_attachment_status(key, ordinal, ocr_status="pending")
+    return key, ordinal, sha
+
+
+def _ocr_status(sup, key, ordinal):
+    with sup.store.lock:
+        return sup.store.conn.execute(
+            "SELECT ocr_status FROM attachments WHERE message_key = ? AND ordinal = ?", (key, ordinal)
+        ).fetchone()[0]
+
+
+class _FailingRunner:
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def run(self, payload: dict, language: str) -> str:
+        raise OcrJobFailed(self.error)
+
+
+def test_a_finally_failed_ocr_job_marks_the_attachment_unavailable(sup_slow):
+    sup_slow.run_once()
+    key, ordinal, sha = _ocr_target(sup_slow)
+    sup_slow.ocr_runner = _FailingRunner("timeout")  # retried until the third failure
+    with sup_slow.store.lock:
+        enqueue(sup_slow.store.conn, "ocr", {"path": "x", "sha256": sha, "ordinal": ordinal, "pages": [0]})
+    seen = []
+    for _ in range(3):
+        with sup_slow.store.lock:
+            job = claim_next(sup_slow.store.conn, ["ocr"])
+        assert not sup_slow._run_ocr_job(job)
+        seen.append(_ocr_status(sup_slow, key, ordinal))
+    assert seen == ["pending", "pending", "unavailable"]
+
+    sup_slow.store.set_attachment_status(key, ordinal, ocr_status="pending")
+    sup_slow.ocr_runner = _FailingRunner("OcrUnavailable: no engine")  # final at once
+    with sup_slow.store.lock:
+        enqueue(sup_slow.store.conn, "ocr", {"path": "x", "sha256": sha, "ordinal": ordinal, "pages": [0]})
+    sup_slow._drain_ocr()
+    assert _ocr_status(sup_slow, key, ordinal) == "unavailable"

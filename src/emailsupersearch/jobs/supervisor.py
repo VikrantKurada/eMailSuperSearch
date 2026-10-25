@@ -42,6 +42,7 @@ from emailsupersearch.ingest.scan import ScanResult, reconcile
 from emailsupersearch.ingest.watcher import FolderWatcher, is_network_path
 from emailsupersearch.ingest.workers import ParsePool
 from emailsupersearch.jobs.queue import (
+    MAX_ATTEMPTS,
     Job,
     claim_next,
     complete,
@@ -479,8 +480,16 @@ class ProjectSupervisor:
         return False
 
     def _fail_job(self, job: Job, error: str, retry: bool) -> None:
+        """Record the failure on the job. When it is final (no retry, or the `MAX_ATTEMPTS`-th failure, the rule
+        ``fail`` applies) the attachment is marked ``ocr_status = "unavailable"``: no OCR text is coming."""
         with self.store.lock:
             fail(self.store.conn, job.id, error, retry=retry)
+        if retry and job.attempts + 1 < MAX_ATTEMPTS:
+            return
+        sha256, ordinal = job.payload.get("sha256"), job.payload.get("ordinal")
+        if isinstance(sha256, str) and isinstance(ordinal, int):
+            with self._run_lock:
+                self.pipeline.mark_ocr_unavailable(sha256, ordinal)
 
     # ---- events ----
 
