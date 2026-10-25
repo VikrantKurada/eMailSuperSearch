@@ -28,6 +28,7 @@ from helpers import wait_until
 from emailsupersearch import cli, logging_setup
 from emailsupersearch.catalog import Catalog
 from emailsupersearch.host import launcher
+from emailsupersearch.host import lock as lock_module
 from emailsupersearch.host.launcher import (
     DEFAULT_PORT,
     choose_port,
@@ -39,6 +40,7 @@ from emailsupersearch.host.launcher import (
 from emailsupersearch.host.lock import (
     RunningInfo,
     acquire,
+    clear,
     process_created,
     read_running,
     read_token,
@@ -398,6 +400,46 @@ def test_stop_with_open_sse_stream_exits_within_10s(tmp_path, redirects):
         reader.join(_EXIT_S)
         assert not reader.is_alive() and ended
     assert not (root / "host.json").exists() and not (root / "host.lock").exists()
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="only Windows refuses to delete an open file")
+
+
+@_WINDOWS_ONLY
+def test_release_waits_for_a_reader_to_close_the_lock(tmp_path):
+    lock = acquire(tmp_path)
+    with open(lock.path, "rb") as reader:  # a concurrent `stop` reading host.lock, as in CI's failing run
+        closer = threading.Timer(0.2, reader.close)
+        closer.start()
+        try:
+            lock.release()  # used to raise PermissionError [WinError 32] and leave the lock behind
+        finally:
+            closer.join()
+    assert not lock.path.exists()
+
+
+@_WINDOWS_ONLY
+def test_clear_waits_for_a_reader_to_close_host_json(tmp_path):
+    write_running(tmp_path, RunningInfo(os.getpid(), 8765, 0))
+    with open(tmp_path / "host.json", "rb") as reader:
+        closer = threading.Timer(0.2, reader.close)
+        closer.start()
+        try:
+            clear(tmp_path)  # a raise here used to skip lock.release() in serve's shutdown
+        finally:
+            closer.join()
+    assert not (tmp_path / "host.json").exists()
+
+
+@_WINDOWS_ONLY
+def test_release_never_raises_when_the_lock_stays_open(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(lock_module, "_UNLINK_TRIES", 2)
+    lock = acquire(tmp_path)
+    with open(lock.path, "rb"), caplog.at_level(logging.WARNING, logger="emailsupersearch.host.lock"):
+        lock.release()
+    assert "could not be removed" in caplog.text and lock.path.exists()
+    lock.release()  # once nothing holds it open the file goes
+    assert not lock.path.exists()
 
 
 def test_stop_waits_for_a_starting_host(tmp_path, monkeypatch, capsys):

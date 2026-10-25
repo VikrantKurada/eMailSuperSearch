@@ -23,11 +23,17 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Windows refuses to delete a file another process has open, and `stop` reads host.lock and host.json while the
+# host removes them on shutdown; the readers hold them for microseconds, so deletes retry for about a second.
+_UNLINK_TRIES = 40
+_UNLINK_PAUSE_S = 0.025
 
 LOCK_FILE = "host.lock"
 RUNNING_FILE = "host.json"
@@ -49,9 +55,10 @@ class InstanceLock:
     created: int = 0
 
     def release(self) -> None:
-        """Remove the lock file; a missing one is fine."""
-        with contextlib.suppress(FileNotFoundError):
-            self.path.unlink()
+        """Remove the lock file; a missing one is fine. Never raises: a lock that cannot be removed is left for the
+        next start, which treats it as stale once this process has exited."""
+        if not _unlink(self.path):
+            log.warning("the instance lock could not be removed; the next start replaces it")
 
 
 @dataclass
@@ -86,8 +93,7 @@ def acquire(root: Path) -> InstanceLock | None:
             if _holder_alive(path):
                 return None
             log.info("replacing a stale instance lock")
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+            _unlink(path)
             continue
         pid = os.getpid()
         created = process_created(pid)
@@ -119,9 +125,25 @@ def write_running(root: Path, info: RunningInfo) -> None:
 
 
 def clear(root: Path) -> None:
-    """Remove ``host.json``; a missing one is fine."""
-    with contextlib.suppress(FileNotFoundError):
-        (root / RUNNING_FILE).unlink()
+    """Remove ``host.json``; a missing one is fine. Never raises: a leftover file names a process that has exited,
+    which ``read_running`` already reports as not running."""
+    if not _unlink(root / RUNNING_FILE):
+        log.warning("host.json could not be removed; it is ignored once this process has exited")
+
+
+def _unlink(path: Path) -> bool:
+    """Delete ``path``; True when it is gone (or never existed). While another process has the file open, Windows
+    raises PermissionError, so this retries for about a second before giving up and returning False."""
+    for attempt in range(_UNLINK_TRIES):
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt + 1 < _UNLINK_TRIES:
+                time.sleep(_UNLINK_PAUSE_S)
+    return False
 
 
 def host_exited(root: Path, info: RunningInfo) -> bool:
